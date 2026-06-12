@@ -1,12 +1,15 @@
 global_settings:
   proxy_port: 8888          # scrapers point here
+  api_bind: 127.0.0.1       # controller API/dashboard host bind; use 0.0.0.0 only behind firewall/auth
   stats_port: 8404          # HAProxy stats UI at /stats
+  stats_bind: 127.0.0.1     # stats host bind; keep local by default on VPS
   api_port: 8800            # controller REST API + dashboard + /metrics
   image: qmcgaw/gluetun:v3
   haproxy_image: haproxy:3.0-alpine
   balance: roundrobin       # or leastconn
   auto_rotate_seconds: 0    # 0 = off; e.g. 1800 rotates one instance every 30 min
   rotate_cooldown: 60       # min seconds between rotations of the same instance
+  rotation_recovery_timeout: 30 # seconds to wait for VPN recovery + changed IP
   poll_interval: 15         # background health/IP poll interval
   # api_key: ""             # optional; auto-generated into .env if omitted
 

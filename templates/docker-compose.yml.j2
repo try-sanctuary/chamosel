@@ -9,14 +9,14 @@ services:
     devices:
       - /dev/net/tun
     environment:
-      - HTTPPROXY=on
-      - HTTPPROXY_LISTENING_ADDRESS=:8888
-      - HEALTH_SERVER_ADDRESS=0.0.0.0:{{ gluetun_health_port }}
+      HTTPPROXY: "on"
+      HTTPPROXY_LISTENING_ADDRESS: ":8888"
+      HEALTH_SERVER_ADDRESS: "0.0.0.0:{{ gluetun_health_port }}"
       # Control server + apikey auth (gluetun v3.40+ requires auth on all routes)
-      - HTTP_CONTROL_SERVER_ADDRESS=0.0.0.0:{{ gluetun_control_port }}
-      - 'HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE={{ auth_default_role }}'
-{% for e in inst.env %}
-      - {{ e }}
+      HTTP_CONTROL_SERVER_ADDRESS: "0.0.0.0:{{ gluetun_control_port }}"
+      HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE: {{ auth_default_role | tojson }}
+{% for k, v in inst.env.items() %}
+      {{ k }}: {{ v | tojson }}
 {% endfor %}
     volumes:
       - gluetun_{{ inst.name }}:/gluetun
@@ -35,7 +35,7 @@ services:
     image: {{ haproxy_image }}
     ports:
       - "{{ proxy_port }}:{{ proxy_port }}/tcp"
-      - "{{ stats_port }}:{{ stats_port }}/tcp"
+      - "{{ stats_bind }}:{{ stats_port }}:{{ stats_port }}/tcp"
     restart: unless-stopped
     volumes:
       - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
@@ -46,16 +46,17 @@ services:
     container_name: chamosel-ctrl
     build: ./controller
     ports:
-      - "{{ api_port }}:{{ controller_port }}/tcp"
+      - "{{ api_bind }}:{{ api_port }}:{{ controller_port }}/tcp"
     environment:
-      - INSTANCES={{ names | join(',') }}
-      - GLUETUN_CONTROL_PORT={{ gluetun_control_port }}
-      - GLUETUN_API_KEY=${GLUETUN_API_KEY}
-      - LISTEN_PORT={{ controller_port }}
-      - AUTO_ROTATE_SECONDS={{ auto_rotate }}
-      - ROTATE_COOLDOWN={{ rotate_cooldown }}
-      - POLL_INTERVAL={{ poll_interval }}
-      - STATE_FILE=/data/state.json
+      INSTANCES: {{ names | join(',') | tojson }}
+      GLUETUN_CONTROL_PORT: "{{ gluetun_control_port }}"
+      GLUETUN_API_KEY: "${GLUETUN_API_KEY}"
+      LISTEN_PORT: "{{ controller_port }}"
+      AUTO_ROTATE_SECONDS: "{{ auto_rotate }}"
+      ROTATE_COOLDOWN: "{{ rotate_cooldown }}"
+      ROTATION_RECOVERY_TIMEOUT: "{{ rotation_recovery_timeout }}"
+      POLL_INTERVAL: "{{ poll_interval }}"
+      STATE_FILE: "/data/state.json"
     volumes:
       - chamosel_state:/data
     restart: unless-stopped

@@ -7,6 +7,7 @@ then lists optional live checks for a Docker/VPN-capable environment.
 
 - Python 3.10+
 - `pyyaml` and `jinja2`
+- Optional local virtualenv: `python3 -m venv .venv && .venv/bin/python -m pip install -r requirements.txt`
 - Docker Compose plugin for optional generated-config validation
 - Real VPN credentials only for optional live checks
 
