@@ -1,0 +1,29 @@
+global_settings:
+  proxy_port: 8888          # scrapers point here
+  stats_port: 8404          # HAProxy stats UI at /stats
+  api_port: 8800            # controller REST API + dashboard + /metrics
+  image: qmcgaw/gluetun:v3
+  haproxy_image: haproxy:3.0-alpine
+  balance: roundrobin       # or leastconn
+  auto_rotate_seconds: 0    # 0 = off; e.g. 1800 rotates one instance every 30 min
+  rotate_cooldown: 60       # min seconds between rotations of the same instance
+  poll_interval: 15         # background health/IP poll interval
+  # api_key: ""             # optional; auto-generated into .env if omitted
+
+vpn_providers:
+
+  surfshark:
+    num_containers: 4
+    env:
+      VPN_TYPE: wireguard
+      WIREGUARD_PRIVATE_KEY: "[YOUR_WG_PRIVATE_KEY]"
+      WIREGUARD_ADDRESSES: "10.14.0.2/16"
+      SERVER_COUNTRIES: "Germany,Netherlands,France,Poland"
+
+  # Mix providers freely:
+  # protonvpn:
+  #   num_containers: 2
+  #   env:
+  #     OPENVPN_USER: "[USERNAME]"
+  #     OPENVPN_PASSWORD: "[PASSWORD]"
+  #     SERVER_COUNTRIES: "Netherlands"

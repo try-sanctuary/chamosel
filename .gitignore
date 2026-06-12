@@ -1,0 +1,11 @@
+config.yml
+docker-compose.yml
+haproxy.cfg
+.env
+state.json
+.specify/
+.agents/
+AGENTS.md
+*.tmp
+__pycache__/
+*.pyc
