@@ -61,7 +61,7 @@ Success response:
   "old_ip": "203.0.113.10",
   "new_ip": "198.51.100.20",
   "elapsed_seconds": 12.4,
-  "message": "rotation recovered"
+  "message": "rotation recovered with a changed public IP"
 }
 ```
 
@@ -75,7 +75,7 @@ Recovery timeout response:
   "old_ip": "203.0.113.10",
   "new_ip": null,
   "elapsed_seconds": 30.0,
-  "message": "instance did not reach usable health within 30s"
+  "message": "VPN did not recover with a new IP within 30s"
 }
 ```
 
@@ -86,6 +86,7 @@ Other allowed outcomes:
 - `command_error`
 - `unauthorized`
 - `unsupported_control`
+- `control_unreachable`
 
 ## `POST /rotate/<name>`
 

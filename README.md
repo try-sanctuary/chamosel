@@ -17,8 +17,9 @@ scraper ──http_proxy──> HAProxy :8888 ──tcp──> gluetun_0 ── 
 
 ## Features
 
-- **Graceful rotation** — stops + starts the VPN inside gluetun, picking a new server without a container restart. HAProxy temporarily drops the instance during reconnect and re-adds it once healthy.
-- **Authenticated** — generates an API key, wires it into each gluetun (`apikey` default role) and the controller. Works with gluetun v3.40+.
+- **Graceful rotation** — stops + starts the VPN inside gluetun, picking a new server without a container restart. The controller counts success only after the tunnel is healthy again with a changed public IP.
+- **Authenticated gluetun control** — generates or reuses a local API key, wires it into each gluetun (`apikey` default role) and the controller. Works with gluetun v3.40+.
+- **Local control surfaces by default** — controller/dashboard and HAProxy stats bind to `127.0.0.1` on the host unless you explicitly change the bind addresses.
 - **API-version aware** — detects `/v1/vpn/status` (v3.41+) vs legacy `/v1/openvpn/status` per instance, cached after first success.
 - **Health-aware pool** — HAProxy probes gluetun's health server (`:9999`), not the proxy port. A gluetun with a dead VPN still answers on the proxy port; chamosel evicts it properly.
 - **Observable** — Prometheus `/metrics`, auto-refreshing dashboard at `/`, per-instance IP history persisted across controller restarts.
@@ -32,9 +33,9 @@ cp config.yml.example config.yml   # add your VPN credentials
 python3 chamosel.py up             # generates key + configs, docker compose up
 
 # Proxy:     http://localhost:8888
-# Dashboard: http://localhost:8800
+# Dashboard: http://localhost:8800       # bound to 127.0.0.1 by default
 # Metrics:   http://localhost:8800/metrics
-# Stats UI:  http://localhost:8404/stats
+# Stats UI:  http://localhost:8404/stats # bound to 127.0.0.1 by default
 
 curl -x http://localhost:8888 https://ipinfo.io/ip
 ```
@@ -76,8 +77,11 @@ chamosel_instances_total
 chamosel_instances_healthy
 chamosel_rotations_total
 chamosel_rotation_errors_total
+chamosel_rotation_errors_by_outcome_total{outcome="..."}
 chamosel_instance_healthy{instance="..."}
+chamosel_instance_status{instance="...",status="..."}
 chamosel_instance_rotations_total{instance="..."}
+chamosel_instance_rotation_errors_by_outcome_total{instance="...",outcome="..."}
 ```
 
 ## Config (`config.yml`)
@@ -85,13 +89,17 @@ chamosel_instance_rotations_total{instance="..."}
 ```yaml
 global_settings:
   proxy_port: 8888
+  api_bind: 127.0.0.1       # use 0.0.0.0 only behind firewall/auth
   stats_port: 8404
+  stats_bind: 127.0.0.1
   api_port: 8800
   image: qmcgaw/gluetun:v3
   balance: roundrobin        # or leastconn
   auto_rotate_seconds: 0     # 0 = off; e.g. 1800 = rotate one every 30 min
   rotate_cooldown: 60        # min seconds between rotations of same instance
+  rotation_recovery_timeout: 30
   poll_interval: 15          # background health/IP poll interval
+  # api_key: ""              # optional local gluetun control-server key
 
 vpn_providers:
   surfshark:
@@ -117,9 +125,10 @@ $res = $client->fetchWithRetry('https://example.com/products');
 ## Notes
 
 - **Per-request IP rotation:** with `mode tcp`, one keep-alive connection pins one exit IP. Set `CURLOPT_FRESH_CONNECT` in PHP (already done in the example) or use `balance leastconn`.
-- **After rotation:** the tunnel needs a few seconds to reconnect. The API returns immediately — poll `/pool` or add a small sleep before relying on the new IP.
+- **After rotation:** the controller waits up to `rotation_recovery_timeout` seconds for a healthy tunnel and changed public IP. If recovery times out, `/rotate` returns `ok: false` with outcome `recovery_timeout`.
+- **Control API key:** `api_key` is not a paid gluetun key and not a provider subscription key. It is a local secret shared between gluetun's control server and the chamosel controller. If you set it in `config.yml`, `generate` writes the same value to `.env` so Docker Compose can pass it to the controller. If `.env` and `config.yml` disagree, generation fails instead of creating a split-brain auth setup.
 - **Surfshark:** caps simultaneous connections per plan. Size `num_containers` accordingly.
-- **API key:** keep `.env` private. Don't expose port 8800 publicly without a reverse proxy.
+- **API/dashboard exposure:** ports `8800` and `8404` bind to localhost by default. If you set `api_bind` or `stats_bind` to `0.0.0.0`, put them behind firewall/reverse-proxy auth.
 - **Docker volumes:** `chamosel.py down` preserves volumes (gluetun servers cache + state). Use `docker compose down -v` to wipe everything.
 
 ## Requirements

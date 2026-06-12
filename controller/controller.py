@@ -26,7 +26,9 @@ Environment:
   LISTEN_PORT          port this service listens on (default 8800)
   AUTO_ROTATE_SECONDS  if >0, rotate one instance every N seconds (default 0)
   ROTATE_COOLDOWN      min seconds between rotations of the same instance (60)
+  ROTATION_RECOVERY_TIMEOUT seconds to wait for healthy+changed IP rotation (30)
   POLL_INTERVAL        background health/IP poll interval seconds (default 15)
+  POLL_WORKERS         max concurrent instance polls (default min(16, pool size))
   STATE_FILE           path to persist state JSON (default /data/state.json)
 
 Endpoints:
@@ -42,11 +44,11 @@ Endpoints:
 
 import json
 import os
-import random
 import threading
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -60,6 +62,23 @@ POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "15"))
 STATE_FILE = os.environ.get("STATE_FILE", "/data/state.json")
 HTTP_TIMEOUT = 8
 IP_HISTORY_MAX = 10
+ROTATION_RECOVERY_TIMEOUT = int(os.environ.get("ROTATION_RECOVERY_TIMEOUT", "30"))
+POLL_WORKERS = int(os.environ.get("POLL_WORKERS", str(max(1, min(16, len(INSTANCES) or 1)))))
+
+STATUS_HEALTHY = "healthy"
+STATUS_RECONNECTING = "reconnecting"
+STATUS_UNREACHABLE = "unreachable"
+STATUS_UNAUTHORIZED = "unauthorized"
+STATUS_UNSUPPORTED_CONTROL = "unsupported_control"
+
+OUTCOME_SUCCESS = "success"
+OUTCOME_COOLDOWN = "cooldown"
+OUTCOME_UNKNOWN_INSTANCE = "unknown_instance"
+OUTCOME_UNAUTHORIZED = "unauthorized"
+OUTCOME_UNSUPPORTED_CONTROL = "unsupported_control"
+OUTCOME_CONTROL_UNREACHABLE = "control_unreachable"
+OUTCOME_COMMAND_ERROR = "command_error"
+OUTCOME_RECOVERY_TIMEOUT = "recovery_timeout"
 
 # New control API (gluetun v3.41+) first, then legacy (v3.40 and older).
 STATUS_PATHS = ("/v1/vpn/status", "/v1/openvpn/status")
@@ -67,6 +86,10 @@ STATUS_PATHS = ("/v1/vpn/status", "/v1/openvpn/status")
 
 def log(msg: str):
     print(f"[chamosel] {time.strftime('%Y-%m-%d %H:%M:%S')} {msg}", flush=True)
+
+
+def sleep(seconds: float):
+    time.sleep(seconds)
 
 
 # --------------------------------------------------------------------------- #
@@ -82,18 +105,23 @@ class State:
             name: {
                 "name": name,
                 "healthy": False,
+                "status": STATUS_UNREACHABLE,
+                "last_error": None,
                 "public_ip": None,
                 "ip_history": [],          # most-recent-first
                 "rotations": 0,
                 "rotation_errors": 0,
                 "last_rotated": 0.0,
                 "last_seen": 0.0,
+                "last_rotation_outcome": None,
                 "status_path": None,       # cached working control path
+                "rotation_errors_by_outcome": {},
             }
             for name in INSTANCES
         }
         self.rotations_total = 0
         self.rotation_errors_total = 0
+        self.rotation_errors_by_outcome = {}
         self._load()
 
     def _load(self):
@@ -103,11 +131,14 @@ class State:
             for name, s in saved.get("inst", {}).items():
                 if name in self.inst:
                     for k in ("ip_history", "rotations", "rotation_errors",
-                              "last_rotated", "public_ip", "status_path"):
+                              "last_rotated", "public_ip", "status_path",
+                              "status", "last_error", "last_rotation_outcome",
+                              "rotation_errors_by_outcome"):
                         if k in s:
                             self.inst[name][k] = s[k]
             self.rotations_total = saved.get("rotations_total", 0)
             self.rotation_errors_total = saved.get("rotation_errors_total", 0)
+            self.rotation_errors_by_outcome = saved.get("rotation_errors_by_outcome", {})
             log(f"loaded state from {STATE_FILE}")
         except FileNotFoundError:
             pass
@@ -123,15 +154,18 @@ class State:
                     "inst": self.inst,
                     "rotations_total": self.rotations_total,
                     "rotation_errors_total": self.rotation_errors_total,
+                    "rotation_errors_by_outcome": self.rotation_errors_by_outcome,
                 }, fh)
             os.replace(tmp, STATE_FILE)
         except Exception as e:
             log(f"could not save state: {e}")
 
-    def update_health(self, name: str, healthy: bool, ip):
+    def update_health(self, name: str, healthy: bool, ip=None, status: str | None = None, error: str | None = None):
         with self.lock:
             s = self.inst[name]
             s["healthy"] = healthy
+            s["status"] = status or (STATUS_HEALTHY if healthy else STATUS_UNREACHABLE)
+            s["last_error"] = error
             s["last_seen"] = time.time()
             if ip and ip != s["public_ip"]:
                 s["public_ip"] = ip
@@ -140,25 +174,46 @@ class State:
                     del s["ip_history"][IP_HISTORY_MAX:]
             self._save_locked()
 
-    def record_rotation(self, name: str, ok: bool):
+    def record_rotation(self, name: str, outcome: str):
         with self.lock:
             s = self.inst[name]
-            if ok:
+            s["last_rotation_outcome"] = outcome
+            if outcome == OUTCOME_SUCCESS:
                 s["rotations"] += 1
                 s["last_rotated"] = time.time()
                 self.rotations_total += 1
             else:
                 s["rotation_errors"] += 1
                 self.rotation_errors_total += 1
+                s["rotation_errors_by_outcome"][outcome] = s["rotation_errors_by_outcome"].get(outcome, 0) + 1
+                self.rotation_errors_by_outcome[outcome] = self.rotation_errors_by_outcome.get(outcome, 0) + 1
+            self._save_locked()
+
+    def mark_rotation_outcome(self, name: str, outcome: str):
+        with self.lock:
+            self.inst[name]["last_rotation_outcome"] = outcome
             self._save_locked()
 
     def set_status_path(self, name: str, path: str):
         with self.lock:
             self.inst[name]["status_path"] = path
 
+    def clear_status_path(self, name: str):
+        with self.lock:
+            self.inst[name]["status_path"] = None
+
     def get_status_path(self, name: str):
         with self.lock:
             return self.inst[name]["status_path"]
+
+    def set_status(self, name: str, status: str, error: str | None = None):
+        with self.lock:
+            s = self.inst[name]
+            s["healthy"] = status == STATUS_HEALTHY
+            s["status"] = status
+            s["last_error"] = error
+            s["last_seen"] = time.time()
+            self._save_locked()
 
     def cooldown_remaining(self, name: str) -> float:
         with self.lock:
@@ -172,6 +227,7 @@ class State:
                 "healthy": sum(1 for s in self.inst.values() if s["healthy"]),
                 "rotations_total": self.rotations_total,
                 "rotation_errors_total": self.rotation_errors_total,
+                "rotation_errors_by_outcome": dict(self.rotation_errors_by_outcome),
                 "instances": [dict(s) for s in self.inst.values()],
             }
 
@@ -202,71 +258,187 @@ def get_public_ip(instance: str):
         return None
 
 
-def detect_status_path(instance: str):
+def detect_status_path(instance: str, force: bool = False):
     """Find the working status path for this gluetun version, cache it."""
     cached = STATE.get_status_path(instance)
-    if cached:
+    if cached and not force:
         return cached
+    if force:
+        STATE.clear_status_path(instance)
+    saw_http = False
     for path in STATUS_PATHS:
         try:
             _ctrl("GET", instance, path)
             STATE.set_status_path(instance, path)
+            STATE.set_status(instance, STATUS_RECONNECTING)
             return path
         except urllib.error.HTTPError as e:
             if e.code == 401:
                 log(f"{instance}: 401 Unauthorized - check GLUETUN_API_KEY / role config")
+                STATE.set_status(instance, STATUS_UNAUTHORIZED, "gluetun returned HTTP 401")
                 return None
-            continue
+            saw_http = True
+            if e.code in (404, 405):
+                continue
+            STATE.set_status(instance, STATUS_UNREACHABLE, f"gluetun returned HTTP {e.code}")
+            return None
         except Exception:
             continue
+    if saw_http:
+        STATE.set_status(instance, STATUS_UNSUPPORTED_CONTROL, "no supported status endpoint")
+    else:
+        STATE.set_status(instance, STATUS_UNREACHABLE, "control server unreachable")
     return None
 
 
-def is_healthy(instance: str) -> bool:
+def status_to_rotation_outcome(status: str) -> str:
+    return {
+        STATUS_UNAUTHORIZED: OUTCOME_UNAUTHORIZED,
+        STATUS_UNSUPPORTED_CONTROL: OUTCOME_UNSUPPORTED_CONTROL,
+        STATUS_UNREACHABLE: OUTCOME_CONTROL_UNREACHABLE,
+    }.get(status, OUTCOME_CONTROL_UNREACHABLE)
+
+
+def read_health(instance: str, retry_stale_path: bool = True) -> tuple[bool, str, str | None]:
     path = detect_status_path(instance)
     if not path:
-        return False
+        snap = STATE.snapshot()["instances"]
+        status = next((s["status"] for s in snap if s["name"] == instance), STATUS_UNREACHABLE)
+        error = next((s["last_error"] for s in snap if s["name"] == instance), None)
+        return False, status, error
     try:
-        return _ctrl("GET", instance, path).get("status", "") == "running"
-    except Exception:
-        return False
+        healthy = _ctrl("GET", instance, path).get("status", "") == "running"
+        return healthy, STATUS_HEALTHY if healthy else STATUS_RECONNECTING, None
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            STATE.set_status(instance, STATUS_UNAUTHORIZED, "gluetun returned HTTP 401")
+            return False, STATUS_UNAUTHORIZED, "gluetun returned HTTP 401"
+        if retry_stale_path and e.code in (404, 405):
+            STATE.clear_status_path(instance)
+            fresh = detect_status_path(instance, force=True)
+            if fresh and fresh != path:
+                return read_health(instance, retry_stale_path=False)
+            STATE.set_status(instance, STATUS_UNSUPPORTED_CONTROL, "cached status endpoint no longer works")
+            return False, STATUS_UNSUPPORTED_CONTROL, "cached status endpoint no longer works"
+        STATE.set_status(instance, STATUS_UNREACHABLE, f"gluetun returned HTTP {e.code}")
+        return False, STATUS_UNREACHABLE, f"gluetun returned HTTP {e.code}"
+    except Exception as e:
+        STATE.set_status(instance, STATUS_UNREACHABLE, str(e))
+        return False, STATUS_UNREACHABLE, str(e)
+
+
+def is_healthy(instance: str) -> bool:
+    healthy, status, error = read_health(instance)
+    STATE.update_health(instance, healthy, None, status=status, error=error)
+    return healthy
+
+
+def refresh_instance(instance: str) -> dict:
+    healthy, status, error = read_health(instance)
+    ip = get_public_ip(instance) if healthy else None
+    STATE.update_health(instance, healthy, ip, status=status, error=error)
+    return {"instance": instance, "healthy": healthy, "status": status, "error": error, "public_ip": ip}
+
+
+def refresh_instances(instances=None):
+    instances = list(instances or INSTANCES)
+    if not instances:
+        return []
+    workers = max(1, min(POLL_WORKERS, len(instances)))
+    results = []
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        future_map = {pool.submit(refresh_instance, inst): inst for inst in instances}
+        for fut in as_completed(future_map):
+            inst = future_map[fut]
+            try:
+                results.append(fut.result())
+            except Exception as e:
+                STATE.update_health(inst, False, None, status=STATUS_UNREACHABLE, error=str(e))
+                results.append({"instance": inst, "healthy": False, "status": STATUS_UNREACHABLE, "error": str(e)})
+    return results
+
+
+def wait_for_recovery(instance: str, old_ip, timeout: int = ROTATION_RECOVERY_TIMEOUT) -> tuple[bool, str | None]:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        h = is_healthy(instance)
+        if h:
+            new_ip = get_public_ip(instance)
+            if new_ip and new_ip != old_ip:
+                STATE.update_health(instance, True, new_ip, status=STATUS_HEALTHY)
+                return True, new_ip
+        sleep(1)
+    return False, None
+
+
+def rotation_response(instance: str | None, ok: bool, outcome: str, started_at: float, **extra) -> dict:
+    payload = {
+        "instance": instance,
+        "ok": ok,
+        "outcome": outcome,
+        "elapsed_seconds": round(time.monotonic() - started_at, 3),
+        "message": extra.pop("message", outcome.replace("_", " ")),
+    }
+    payload.update(extra)
+    return payload
 
 
 def rotate_instance(instance: str, force: bool = False) -> dict:
     """Graceful rotation: PUT status stopped, then running. New server, no
     container restart. HAProxy drops the instance via health checks while it
     reconnects and re-adds it on recovery."""
+    started_at = time.monotonic()
     if instance not in INSTANCES:
-        return {"instance": instance, "ok": False, "error": "unknown instance"}
+        return rotation_response(instance, False, OUTCOME_UNKNOWN_INSTANCE, started_at,
+                                 message="unknown instance")
     if not force:
         cd = STATE.cooldown_remaining(instance)
         if cd > 0:
-            return {"instance": instance, "ok": False,
-                    "error": f"cooldown: {cd:.0f}s remaining"}
+            STATE.mark_rotation_outcome(instance, OUTCOME_COOLDOWN)
+            return rotation_response(instance, False, OUTCOME_COOLDOWN, started_at,
+                                     message=f"cooldown: {cd:.0f}s remaining")
     path = detect_status_path(instance)
     if not path:
-        STATE.record_rotation(instance, ok=False)
-        return {"instance": instance, "ok": False,
-                "error": "control server unreachable/unauthorized"}
+        current = next((s for s in STATE.snapshot()["instances"] if s["name"] == instance), {})
+        outcome = status_to_rotation_outcome(current.get("status", STATUS_UNREACHABLE))
+        STATE.record_rotation(instance, outcome)
+        return rotation_response(instance, False, outcome, started_at,
+                                 message="control server unreachable/unauthorized")
     old_ip = STATE.inst[instance]["public_ip"] or get_public_ip(instance)
     try:
         _ctrl("PUT", instance, path, {"status": "stopped"})
-        time.sleep(1)
+        sleep(1)
         _ctrl("PUT", instance, path, {"status": "running"})
     except Exception as e:
-        STATE.record_rotation(instance, ok=False)
-        return {"instance": instance, "ok": False, "error": str(e)}
-    STATE.record_rotation(instance, ok=True)
-    log(f"rotated {instance} (was {old_ip})")
-    return {"instance": instance, "ok": True, "old_ip": old_ip,
-            "note": "new IP available once tunnel reconnects (poll /pool)"}
+        STATE.record_rotation(instance, OUTCOME_COMMAND_ERROR)
+        return rotation_response(instance, False, OUTCOME_COMMAND_ERROR, started_at,
+                                 old_ip=old_ip, message=str(e))
+    STATE.update_health(instance, False, old_ip, status=STATUS_RECONNECTING)
+    recovered, new_ip = wait_for_recovery(instance, old_ip)
+    if not recovered:
+        STATE.record_rotation(instance, OUTCOME_RECOVERY_TIMEOUT)
+        return rotation_response(
+            instance,
+            False,
+            OUTCOME_RECOVERY_TIMEOUT,
+            started_at,
+            old_ip=old_ip,
+            new_ip=new_ip,
+            message=f"VPN did not recover with a new IP within {ROTATION_RECOVERY_TIMEOUT}s",
+        )
+    STATE.record_rotation(instance, OUTCOME_SUCCESS)
+    log(f"rotated {instance} ({old_ip} -> {new_ip})")
+    return rotation_response(instance, True, OUTCOME_SUCCESS, started_at,
+                             old_ip=old_ip, new_ip=new_ip,
+                             message="rotation recovered with a changed public IP")
 
 
 def rotate_one_random(force: bool = False) -> dict:
     """Pick an instance not in cooldown; prefer ones rotated longest ago."""
     candidates = [n for n in INSTANCES if force or STATE.cooldown_remaining(n) == 0]
     if not candidates:
-        return {"ok": False, "error": "all instances in cooldown"}
+        return rotation_response(None, False, OUTCOME_COOLDOWN, time.monotonic(),
+                                 message="all instances in cooldown")
     candidates.sort(key=lambda n: STATE.inst[n]["last_rotated"])
     return rotate_instance(candidates[0], force=force)
 
@@ -278,17 +450,14 @@ def rotate_one_random(force: bool = False) -> dict:
 def poll_loop():
     log(f"poller started, interval={POLL_INTERVAL}s")
     while True:
-        for inst in INSTANCES:
-            healthy = is_healthy(inst)
-            ip = get_public_ip(inst) if healthy else None
-            STATE.update_health(inst, healthy, ip)
-        time.sleep(POLL_INTERVAL)
+        refresh_instances()
+        sleep(POLL_INTERVAL)
 
 
 def auto_rotate_loop():
     log(f"auto-rotate every {AUTO_ROTATE}s")
     while True:
-        time.sleep(AUTO_ROTATE)
+        sleep(AUTO_ROTATE)
         log(f"auto-rotate: {rotate_one_random()}")
 
 
@@ -311,15 +480,29 @@ def render_metrics() -> str:
         "# HELP chamosel_rotation_errors_total Total failed rotations.",
         "# TYPE chamosel_rotation_errors_total counter",
         f"chamosel_rotation_errors_total {snap['rotation_errors_total']}",
+        "# HELP chamosel_rotation_errors_by_outcome_total Failed rotations by outcome.",
+        "# TYPE chamosel_rotation_errors_by_outcome_total counter",
         "# HELP chamosel_instance_healthy Per-instance health (1=healthy).",
         "# TYPE chamosel_instance_healthy gauge",
+        "# HELP chamosel_instance_status Per-instance status label (1=current status).",
+        "# TYPE chamosel_instance_status gauge",
         "# HELP chamosel_instance_rotations_total Per-instance rotation count.",
         "# TYPE chamosel_instance_rotations_total counter",
+        "# HELP chamosel_instance_rotation_errors_by_outcome_total Per-instance failed rotations by outcome.",
+        "# TYPE chamosel_instance_rotation_errors_by_outcome_total counter",
     ]
+    for outcome, value in snap.get("rotation_errors_by_outcome", {}).items():
+        lines.append(f'chamosel_rotation_errors_by_outcome_total{{outcome="{outcome}"}} {value}')
     for s in snap["instances"]:
         lines.append(f'chamosel_instance_healthy{{instance="{s["name"]}"}} {1 if s["healthy"] else 0}')
+        lines.append(f'chamosel_instance_status{{instance="{s["name"]}",status="{s["status"]}"}} 1')
     for s in snap["instances"]:
         lines.append(f'chamosel_instance_rotations_total{{instance="{s["name"]}"}} {s["rotations"]}')
+        for outcome, value in s.get("rotation_errors_by_outcome", {}).items():
+            lines.append(
+                f'chamosel_instance_rotation_errors_by_outcome_total'
+                f'{{instance="{s["name"]}",outcome="{outcome}"}} {value}'
+            )
     return "\n".join(lines) + "\n"
 
 
@@ -331,9 +514,10 @@ def render_dashboard() -> str:
         dot = "#22c55e" if s["healthy"] else "#ef4444"
         last_rot = "never" if not s["last_rotated"] else f"{int(now - s['last_rotated'])}s ago"
         hist = ", ".join(s["ip_history"][:5]) or "-"
+        state = s.get("status") or ("healthy" if s["healthy"] else "down")
         rows.append(
             f'<tr><td><span class="dot" style="background:{dot}"></span>{s["name"]}</td>'
-            f'<td>{"healthy" if s["healthy"] else "down"}</td>'
+            f'<td>{state}</td>'
             f'<td class="ip">{s["public_ip"] or "-"}</td>'
             f'<td>{s["rotations"]}</td><td>{last_rot}</td>'
             f'<td class="hist">{hist}</td></tr>'
@@ -396,9 +580,7 @@ class Handler(BaseHTTPRequestHandler):
             self._raw(200, render_metrics().encode(), "text/plain; version=0.0.4")
         elif parsed.path == "/pool":
             if parse_qs(parsed.query).get("fresh"):
-                for inst in INSTANCES:
-                    h = is_healthy(inst)
-                    STATE.update_health(inst, h, get_public_ip(inst) if h else None)
+                refresh_instances()
             self._json(200, STATE.snapshot())
         else:
             self._json(404, {"error": "not found"})

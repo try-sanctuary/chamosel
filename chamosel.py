@@ -21,6 +21,7 @@ Usage:
 """
 
 import argparse
+from dataclasses import dataclass
 import json
 import logging
 import os
@@ -46,6 +47,8 @@ CONTROLLER_PORT = 8800
 
 DEFAULTS = {
     "proxy_port": 8888,
+    "api_bind": "127.0.0.1",
+    "stats_bind": "127.0.0.1",
     "stats_port": 8404,
     "api_port": 8800,
     "image": "qmcgaw/gluetun:v3",
@@ -53,6 +56,7 @@ DEFAULTS = {
     "balance": "roundrobin",
     "auto_rotate_seconds": 0,
     "rotate_cooldown": 60,
+    "rotation_recovery_timeout": 30,
     "poll_interval": 15,
 }
 
@@ -73,7 +77,8 @@ def gen_api_key() -> str:
 
 def load_config(path: str) -> dict:
     try:
-        cfg = yaml.safe_load(open(path)) or {}
+        with open(path) as fh:
+            cfg = yaml.safe_load(fh) or {}
     except FileNotFoundError:
         log.error("Config not found: %s (copy config.yml.example)", path)
         sys.exit(1)
@@ -96,34 +101,93 @@ def iter_instances(cfg: dict):
             yield f"{pkey}_{i}", pkey, prov
 
 
-def env_for(pkey: str, prov: dict) -> list:
+def env_for(pkey: str, prov: dict) -> dict:
     name = prov.get("provider_name", pkey.replace("_", " ").lower())
-    out = [f"VPN_SERVICE_PROVIDER={name}"]
+    out = {"VPN_SERVICE_PROVIDER": str(name)}
     for k, v in (prov.get("env") or {}).items():
-        out.append(f"{k}={v}")
+        out[str(k)] = "" if v is None else str(v)
     return out
 
 
+@dataclass(frozen=True)
+class ApiKeyResolution:
+    key: str
+    source: str
+
+
+def read_env_api_key(path: str = ENV_FILE) -> str:
+    try:
+        with open(path) as fh:
+            for line in fh:
+                if line.startswith("GLUETUN_API_KEY="):
+                    return line.split("=", 1)[1].strip()
+    except FileNotFoundError:
+        return ""
+    return ""
+
+
+def write_env_api_key(key: str, path: str = ENV_FILE):
+    lines = []
+    found = False
+    try:
+        with open(path) as fh:
+            for line in fh:
+                if line.startswith("GLUETUN_API_KEY="):
+                    lines.append(f"GLUETUN_API_KEY={key}\n")
+                    found = True
+                else:
+                    lines.append(line)
+    except FileNotFoundError:
+        pass
+    if not found:
+        lines.append(f"GLUETUN_API_KEY={key}\n")
+    with open(path, "w") as fh:
+        fh.writelines(lines)
+
+
+def resolve_api_key_info(cfg: dict, env_path: str = ENV_FILE) -> ApiKeyResolution:
+    """Resolve and persist one control API key shared by gluetun and controller."""
+    env_key = os.environ.get("GLUETUN_API_KEY", "").strip()
+    file_key = read_env_api_key(env_path)
+    cfg_key = cfg.get("global_settings", {}).get("api_key") or ""
+    cfg_key = str(cfg_key).strip()
+
+    if file_key and cfg_key and file_key != cfg_key:
+        log.error(
+            "Conflicting GLUETUN_API_KEY values in %s and global_settings.api_key; "
+            "remove one or make them identical.",
+            env_path,
+        )
+        sys.exit(1)
+    if env_key:
+        return ApiKeyResolution(env_key, "environment")
+    if file_key:
+        return ApiKeyResolution(file_key, env_path)
+    if cfg_key:
+        write_env_api_key(cfg_key, env_path)
+        return ApiKeyResolution(cfg_key, "config")
+
+    key = gen_api_key()
+    write_env_api_key(key, env_path)
+    log.info("Generated API key, saved to %s", env_path)
+    return ApiKeyResolution(key, "generated")
+
+
 def resolve_api_key(cfg: dict) -> str:
-    """Order: env GLUETUN_API_KEY -> .env file -> config -> generate + persist."""
-    key = os.environ.get("GLUETUN_API_KEY", "").strip()
-    if key:
-        return key
-    if os.path.exists(ENV_FILE):
-        for line in open(ENV_FILE):
-            if line.startswith("GLUETUN_API_KEY="):
-                return line.split("=", 1)[1].strip()
-    key = gset(cfg, "api_key") if cfg.get("global_settings", {}).get("api_key") else ""
-    if not key:
-        key = gen_api_key()
-        with open(ENV_FILE, "a") as fh:
-            fh.write(f"GLUETUN_API_KEY={key}\n")
-        log.info("Generated API key, saved to %s", ENV_FILE)
-    return key
+    """Backward-compatible key-only wrapper for callers."""
+    return resolve_api_key_info(cfg).key
+
+
+def write_text(path: str, content: str):
+    with open(path, "w") as fh:
+        fh.write(content)
 
 
 def generate(cfg: dict):
-    api_key = resolve_api_key(cfg)
+    api_key_info = resolve_api_key_info(cfg)
+    api_key = api_key_info.key
+    if api_key_info.source == "config":
+        log.info("Persisted global_settings.api_key to %s for controller interpolation", ENV_FILE)
     # gluetun v3.41+ default-role apikey auth via env (no config.toml mount needed)
     auth_role = json.dumps({"auth": "apikey", "apikey": api_key}, separators=(",", ":"))
     instances = list(iter_instances(cfg))
@@ -134,18 +198,21 @@ def generate(cfg: dict):
         names=names,
         image=gset(cfg, "image"),
         haproxy_image=gset(cfg, "haproxy_image"),
+        api_bind=gset(cfg, "api_bind"),
+        stats_bind=gset(cfg, "stats_bind"),
         proxy_port=gset(cfg, "proxy_port"),
         stats_port=gset(cfg, "stats_port"),
         api_port=gset(cfg, "api_port"),
         auto_rotate=gset(cfg, "auto_rotate_seconds"),
         rotate_cooldown=gset(cfg, "rotate_cooldown"),
+        rotation_recovery_timeout=gset(cfg, "rotation_recovery_timeout"),
         poll_interval=gset(cfg, "poll_interval"),
         auth_default_role=auth_role,
         gluetun_health_port=GLUETUN_HEALTH_PORT,
         gluetun_control_port=GLUETUN_CONTROL_PORT,
         controller_port=CONTROLLER_PORT,
     )
-    open(COMPOSE_FILE, "w").write(compose)
+    write_text(COMPOSE_FILE, compose)
 
     haproxy = jinja.get_template("haproxy.cfg.j2").render(
         names=names,
@@ -155,7 +222,7 @@ def generate(cfg: dict):
         gluetun_proxy_port=GLUETUN_PROXY_PORT,
         gluetun_health_port=GLUETUN_HEALTH_PORT,
     )
-    open(HAPROXY_FILE, "w").write(haproxy)
+    write_text(HAPROXY_FILE, haproxy)
     log.info("Generated %s (%d instances) and %s", COMPOSE_FILE, len(names), HAPROXY_FILE)
 
 
@@ -188,9 +255,13 @@ def cmd_up(cfg):
 
 def cmd_status(cfg):
     data = api_call(cfg, "GET", "/pool")
-    print(f"{'INSTANCE':<28} {'HEALTHY':<8} {'ROT':<5} PUBLIC IP")
+    print(f"{'INSTANCE':<28} {'STATUS':<20} {'HEALTHY':<8} {'ROT':<5} PUBLIC IP")
     for it in data.get("instances", []):
-        print(f"{it['name']:<28} {str(it['healthy']):<8} {it['rotations']:<5} {it.get('public_ip') or '-'}")
+        status = it.get("status") or ("healthy" if it.get("healthy") else "down")
+        print(
+            f"{it['name']:<28} {status:<20} {str(it['healthy']):<8} "
+            f"{it['rotations']:<5} {it.get('public_ip') or '-'}"
+        )
     print(f"\nhealthy {data.get('healthy')}/{data.get('count')}  rotations {data.get('rotations_total')}")
 
 

@@ -25,7 +25,8 @@ The implementation should expose enough signal to distinguish failure classes.
 Recommended metrics:
 
 ```text
-chamosel_instance_rotation_errors_total{instance="...",outcome="..."}
+chamosel_rotation_errors_by_outcome_total{outcome="..."}
+chamosel_instance_rotation_errors_by_outcome_total{instance="...",outcome="..."}
 chamosel_instance_status{instance="...",status="..."}
 ```
 
@@ -35,6 +36,7 @@ Allowed `outcome` labels:
 - `recovery_timeout`
 - `unauthorized`
 - `unsupported_control`
+- `control_unreachable`
 
 Allowed `status` labels:
 
