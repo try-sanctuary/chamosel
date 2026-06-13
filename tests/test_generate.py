@@ -116,6 +116,10 @@ class GenerateTests(unittest.TestCase):
         cfg["global_settings"]["pool_degraded_min_healthy"] = 2
         cfg["global_settings"]["auto_repair_duplicate_ips"] = False
         cfg["global_settings"]["duplicate_repair_retry_cooldown"] = 180
+        cfg["global_settings"]["egress_verify_target"] = "https://ifconfig.co/json"
+        cfg["global_settings"]["egress_verify_timeout"] = 12
+        cfg["global_settings"]["egress_verify_ttl"] = 90
+        cfg["global_settings"]["egress_verify_on_fresh"] = False
 
         self.chamosel.generate(cfg)
         compose = yaml.safe_load(Path("docker-compose.yml").read_text())
@@ -126,6 +130,10 @@ class GenerateTests(unittest.TestCase):
         self.assertEqual("2", env["POOL_DEGRADED_MIN_HEALTHY"])
         self.assertEqual("false", env["AUTO_REPAIR_DUPLICATE_IPS"])
         self.assertEqual("180", env["DUPLICATE_REPAIR_RETRY_COOLDOWN"])
+        self.assertEqual("https://ifconfig.co/json", env["EGRESS_VERIFY_TARGET"])
+        self.assertEqual("12", env["EGRESS_VERIFY_TIMEOUT"])
+        self.assertEqual("90", env["EGRESS_VERIFY_TTL"])
+        self.assertEqual("false", env["EGRESS_VERIFY_ON_FRESH"])
 
     def test_cmd_up_pulls_runtime_images_by_default(self):
         calls = []

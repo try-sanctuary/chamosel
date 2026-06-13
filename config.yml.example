@@ -16,6 +16,10 @@ global_settings:
   pool_degraded_min_healthy: auto # auto = all configured backends should be healthy
   auto_repair_duplicate_ips: true # rotate one duplicate-IP backend after health refresh
   duplicate_repair_retry_cooldown: 300 # retry delay after failed duplicate-IP repair
+  egress_verify_target: https://ifconfig.co/json # target used to verify actual proxy exit IP
+  egress_verify_timeout: 10 # per-backend verified proxy IP timeout
+  egress_verify_ttl: 120    # seconds to trust cached verified proxy IP
+  egress_verify_on_fresh: true # /pool?fresh=1 refreshes verified proxy IP when expired
   poll_interval: 15         # background health/IP poll interval
   # api_key: ""             # optional; auto-generated into .env if omitted
 

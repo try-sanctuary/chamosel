@@ -70,6 +70,10 @@ DEFAULTS = {
     "pool_degraded_min_healthy": "auto",
     "auto_repair_duplicate_ips": True,
     "duplicate_repair_retry_cooldown": 300,
+    "egress_verify_target": DEFAULT_LEAK_TARGET,
+    "egress_verify_timeout": 10,
+    "egress_verify_ttl": 120,
+    "egress_verify_on_fresh": True,
     "poll_interval": 15,
 }
 
@@ -225,6 +229,10 @@ def generate(cfg: dict):
         pool_degraded_min_healthy=gset(cfg, "pool_degraded_min_healthy"),
         auto_repair_duplicate_ips=str(gset(cfg, "auto_repair_duplicate_ips")).lower(),
         duplicate_repair_retry_cooldown=gset(cfg, "duplicate_repair_retry_cooldown"),
+        egress_verify_target=gset(cfg, "egress_verify_target"),
+        egress_verify_timeout=gset(cfg, "egress_verify_timeout"),
+        egress_verify_ttl=gset(cfg, "egress_verify_ttl"),
+        egress_verify_on_fresh=str(gset(cfg, "egress_verify_on_fresh")).lower(),
         poll_interval=gset(cfg, "poll_interval"),
         auth_default_role=auth_role,
         gluetun_health_port=GLUETUN_HEALTH_PORT,
@@ -458,10 +466,21 @@ def normalize_probe_result(instance: dict, direct_ip: str, payload: dict, error:
             result_error = str(e)
 
     metadata = payload if isinstance(payload, dict) else {}
+    controller_verified_proxy_ip = instance.get("verified_proxy_ip")
+    controller_public_ip = instance.get("public_ip")
+    controller_proxy_ip_mismatch = bool(
+        controller_verified_proxy_ip
+        and proxy_ip
+        and controller_verified_proxy_ip != proxy_ip
+    )
     return {
         "name": instance.get("name") or "",
         "controller_status": instance.get("status") or ("healthy" if instance.get("healthy") else "down"),
-        "controller_public_ip": instance.get("public_ip"),
+        "controller_public_ip": controller_public_ip,
+        "controller_verified_proxy_ip": controller_verified_proxy_ip,
+        "controller_public_ip_mismatch": bool(instance.get("public_ip_mismatch")),
+        "controller_proxy_ip_mismatch": controller_proxy_ip_mismatch,
+        "controller_egress_state_fresh": bool(instance.get("egress_state_fresh")),
         "proxy_ok": proxy_ok and not leak_detected and result_error is None,
         "proxy_ip": proxy_ip,
         "country": metadata.get("country"),
@@ -532,7 +551,7 @@ def render_leak_table(result: dict) -> str:
     lines = [f"Direct host IP: {result.get('direct_ip') or '-'}", ""]
     lines.append(
         f"{'INSTANCE':<28} {'STATUS':<20} {'CONTROLLER_IP':<16} "
-        f"{'PROXY_IP':<16} {'COUNTRY':<16} {'ASN':<12} RESULT"
+        f"{'CTRL_VERIFIED':<16} {'PROXY_IP':<16} {'COUNTRY':<16} {'ASN':<12} RESULT"
     )
     for item in result.get("instances", []):
         reason = "ok" if item.get("proxy_ok") and not item.get("error") else (item.get("error") or "failed")
@@ -540,6 +559,7 @@ def render_leak_table(result: dict) -> str:
             f"{item.get('name') or '-':<28} "
             f"{item.get('controller_status') or '-':<20} "
             f"{item.get('controller_public_ip') or '-':<16} "
+            f"{item.get('controller_verified_proxy_ip') or '-':<16} "
             f"{item.get('proxy_ip') or '-':<16} "
             f"{item.get('country') or '-':<16} "
             f"{item.get('asn') or '-':<12} "
@@ -766,33 +786,52 @@ def doctor_repair_decision(pool_ok: bool, pool_payload: dict) -> dict:
         }
 
     duplicate_repair = pool_payload.get("duplicate_repair") or {}
-    if "duplicate_public_ip" in reasons:
+    duplicate_reason = None
+    if "verified_duplicate_proxy_ip" in reasons:
+        duplicate_reason = "verified_duplicate_proxy_ip"
+    elif "duplicate_public_ip" in reasons:
+        duplicate_reason = "duplicate_public_ip"
+
+    if duplicate_reason:
         if not duplicate_repair.get("enabled", False):
             return {
                 "action": "manual",
                 "reason": "duplicate_repair_disabled",
-                "message": "duplicate public IP detected, but automatic repair is disabled",
+                "message": "duplicate egress IP detected, but automatic repair is disabled",
             }
         in_flight = duplicate_repair.get("in_flight") or []
         if in_flight:
             return {
                 "action": "repair_in_progress",
-                "reason": "duplicate_public_ip",
+                "reason": duplicate_reason,
                 "targets": in_flight,
-                "message": "duplicate public IP repair is already rotating one backend",
+                "message": "duplicate egress IP repair is already rotating one backend",
             }
         backoff = duplicate_repair.get("backoff_remaining") or {}
         if backoff:
             return {
                 "action": "wait_backoff",
-                "reason": "duplicate_public_ip",
+                "reason": duplicate_reason,
                 "backoff_remaining": backoff,
-                "message": "duplicate public IP repair recently failed; waiting before retry",
+                "message": "duplicate egress IP repair recently failed; waiting before retry",
             }
         return {
             "action": "repair_requested",
-            "reason": "duplicate_public_ip",
-            "message": "fresh pool check requested duplicate public IP repair",
+            "reason": duplicate_reason,
+            "message": "fresh pool check requested duplicate egress IP repair",
+        }
+
+    if "public_ip_mismatch" in reasons:
+        return {
+            "action": "monitor",
+            "reason": "public_ip_mismatch",
+            "message": "gluetun public IP differs from verified proxy IP; no rotation unless verified proxy IP is duplicated",
+        }
+    if "egress_verification_failed" in reasons:
+        return {
+            "action": "manual",
+            "reason": "egress_verification_failed",
+            "message": "controller could not verify proxy egress; inspect backend proxy/network before rotating",
         }
     if "stale_state" in reasons:
         return {
@@ -862,15 +901,19 @@ def cmd_up(cfg, pull_images: bool = True):
 
 def cmd_status(cfg):
     data = api_call(cfg, "GET", "/pool")
-    print(f"{'INSTANCE':<28} {'STATUS':<20} {'FRESH':<6} {'HEALTHY':<8} {'ROT':<5} {'OUTCOME':<22} {'COOLDOWN':<16} PUBLIC IP")
+    print(
+        f"{'INSTANCE':<28} {'STATUS':<20} {'FRESH':<6} {'EGRESS':<6} {'HEALTHY':<8} "
+        f"{'ROT':<5} {'OUTCOME':<22} {'COOLDOWN':<16} {'PUBLIC IP':<16} VERIFIED IP"
+    )
     for it in data.get("instances", []):
         status = it.get("status") or ("healthy" if it.get("healthy") else "down")
         cooldown = float(it.get("cooldown_remaining_seconds") or 0)
         cooldown_text = f"{cooldown:.0f}s" if cooldown > 0 else "-"
         print(
-            f"{it['name']:<28} {status:<20} {str(bool(it.get('state_fresh'))):<6} {str(it['healthy']):<8} "
+            f"{it['name']:<28} {status:<20} {str(bool(it.get('state_fresh'))):<6} "
+            f"{str(bool(it.get('egress_state_fresh'))):<6} {str(it['healthy']):<8} "
             f"{it['rotations']:<5} {it.get('last_rotation_outcome') or '-':<22} "
-            f"{cooldown_text:<16} {it.get('public_ip') or '-'}"
+            f"{cooldown_text:<16} {it.get('public_ip') or '-':<16} {it.get('verified_proxy_ip') or '-'}"
         )
     print(
         f"\npool {data.get('pool_status', '-')} fresh {data.get('state_fresh', False)} "

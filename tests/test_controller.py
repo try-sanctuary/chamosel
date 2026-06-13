@@ -99,7 +99,7 @@ class ControllerTests(unittest.TestCase):
         self.ctrl.POLL_WORKERS = 4
         self.ctrl.STATE = self.ctrl.State()
 
-        def slow_refresh(instance):
+        def slow_refresh(instance, verify_egress=False, force_egress=False):
             time.sleep(0.2)
             return {"instance": instance}
 
@@ -115,8 +115,9 @@ class ControllerTests(unittest.TestCase):
         called = {"refresh": False}
         captured = {}
 
-        def fake_refresh():
+        def fake_refresh(verify_egress=False, force_egress=False):
             called["refresh"] = True
+            captured["verify_egress"] = verify_egress
             self.ctrl.STATE.update_health("vpn_0", True, "9.9.9.9", status=self.ctrl.STATUS_HEALTHY)
 
         handler = self.ctrl.Handler.__new__(self.ctrl.Handler)
@@ -127,6 +128,7 @@ class ControllerTests(unittest.TestCase):
         handler.do_GET()
 
         self.assertTrue(called["refresh"])
+        self.assertTrue(captured["verify_egress"])
         self.assertEqual(200, captured["code"])
         self.assertEqual("9.9.9.9", captured["payload"]["instances"][0]["public_ip"])
 
@@ -149,6 +151,7 @@ class ControllerTests(unittest.TestCase):
         self.ctrl._ctrl = fake_ctrl
         self.ctrl.get_public_ip = lambda instance: "2.2.2.2" if health_calls["count"] >= 2 else "1.1.1.1"
         self.ctrl.is_healthy = fake_healthy
+        self.ctrl.refresh_verified_proxy_ip = lambda instance, force=False: {"verified_proxy_ip": "2.2.2.2"}
         self.ctrl.sleep = lambda seconds: None
 
         self.ctrl.STATE.update_health("vpn_0", True, "1.1.1.1", status=self.ctrl.STATUS_HEALTHY)
@@ -290,6 +293,105 @@ class ControllerTests(unittest.TestCase):
 
         self.assertEqual(self.ctrl.POOL_STATUS_DEGRADED, snap["pool_status"])
         self.assertIn(self.ctrl.DEGRADED_DUPLICATE_PUBLIC_IP, snap["degraded_reasons"])
+
+    def test_verified_proxy_ip_preferred_over_duplicate_public_ip(self):
+        self.ctrl.STATE.update_health("vpn_0", True, "1.1.1.1", status=self.ctrl.STATUS_HEALTHY)
+        self.ctrl.STATE.update_health("vpn_1", True, "1.1.1.1", status=self.ctrl.STATUS_HEALTHY)
+        self.ctrl.STATE.update_verified_proxy_ip("vpn_0", "45.134.140.5")
+        self.ctrl.STATE.update_verified_proxy_ip("vpn_1", "89.187.163.10")
+
+        snap = self.ctrl.STATE.snapshot()
+
+        self.assertEqual(self.ctrl.POOL_STATUS_DEGRADED, snap["pool_status"])
+        self.assertIn(self.ctrl.DEGRADED_PUBLIC_IP_MISMATCH, snap["degraded_reasons"])
+        self.assertNotIn(self.ctrl.DEGRADED_DUPLICATE_PUBLIC_IP, snap["degraded_reasons"])
+        self.assertNotIn(self.ctrl.DEGRADED_VERIFIED_DUPLICATE_PROXY_IP, snap["degraded_reasons"])
+
+    def test_duplicate_verified_proxy_ip_marks_pool_degraded(self):
+        self.ctrl.STATE.update_health("vpn_0", True, "1.1.1.1", status=self.ctrl.STATUS_HEALTHY)
+        self.ctrl.STATE.update_health("vpn_1", True, "2.2.2.2", status=self.ctrl.STATUS_HEALTHY)
+        self.ctrl.STATE.update_verified_proxy_ip("vpn_0", "45.134.140.5")
+        self.ctrl.STATE.update_verified_proxy_ip("vpn_1", "45.134.140.5")
+
+        snap = self.ctrl.STATE.snapshot()
+
+        self.assertEqual(self.ctrl.POOL_STATUS_DEGRADED, snap["pool_status"])
+        self.assertIn(self.ctrl.DEGRADED_VERIFIED_DUPLICATE_PROXY_IP, snap["degraded_reasons"])
+
+    def test_failed_egress_probe_sets_error_and_degrades_pool(self):
+        self.ctrl.STATE.update_health("vpn_0", True, "1.1.1.1", status=self.ctrl.STATUS_HEALTHY)
+        self.ctrl.probe_verified_proxy_ip = lambda instance: (None, "proxy refused")
+
+        result = self.ctrl.refresh_verified_proxy_ip("vpn_0", force=True)
+        snap = self.ctrl.STATE.snapshot()
+
+        self.assertEqual("proxy refused", result["error"])
+        self.assertEqual("proxy refused", snap["instances"][0]["verified_proxy_ip_error"])
+        self.assertIn(self.ctrl.DEGRADED_EGRESS_VERIFICATION_FAILED, snap["degraded_reasons"])
+
+    def test_refresh_verified_proxy_ip_uses_ttl_cache(self):
+        calls = []
+        self.ctrl.EGRESS_VERIFY_TTL = 120
+        self.ctrl.STATE.update_health("vpn_0", True, "1.1.1.1", status=self.ctrl.STATUS_HEALTHY)
+        self.ctrl.STATE.update_verified_proxy_ip("vpn_0", "45.134.140.5")
+        self.ctrl.probe_verified_proxy_ip = lambda instance: calls.append(instance) or ("89.187.163.10", None)
+
+        cached = self.ctrl.refresh_verified_proxy_ip("vpn_0")
+        self.assertTrue(cached["cached"])
+        self.assertEqual([], calls)
+
+        with self.ctrl.STATE.lock:
+            self.ctrl.STATE.inst["vpn_0"]["verified_proxy_ip_seen_at"] = time.time() - 121
+        refreshed = self.ctrl.refresh_verified_proxy_ip("vpn_0")
+
+        self.assertEqual("89.187.163.10", refreshed["verified_proxy_ip"])
+        self.assertEqual(["vpn_0"], calls)
+
+    def test_extract_verified_proxy_ip_accepts_ifconfig_json(self):
+        self.assertEqual("45.134.140.5", self.ctrl.extract_verified_proxy_ip({"ip": "45.134.140.5"}))
+
+    def test_public_ip_mismatch_does_not_schedule_repair_when_verified_ips_unique(self):
+        calls = []
+        self.ctrl.rotate_instance = lambda instance, force=False: calls.append(instance) or {"ok": True}
+        self.ctrl.STATE.update_health("vpn_0", True, "1.1.1.1", status=self.ctrl.STATUS_HEALTHY)
+        self.ctrl.STATE.update_health("vpn_1", True, "1.1.1.1", status=self.ctrl.STATUS_HEALTHY)
+        self.ctrl.STATE.update_verified_proxy_ip("vpn_0", "45.134.140.5")
+        self.ctrl.STATE.update_verified_proxy_ip("vpn_1", "89.187.163.10")
+
+        self.ctrl.maybe_schedule_duplicate_ip_repair()
+
+        self.assertEqual([], calls)
+
+    def test_duplicate_verified_proxy_ip_refresh_schedules_one_repair_rotation(self):
+        calls = []
+
+        class ImmediateThread:
+            def __init__(self, target, args=(), daemon=None):
+                self.target = target
+                self.args = args
+
+            def start(self):
+                self.target(*self.args)
+
+        original_thread = self.ctrl.threading.Thread
+        try:
+            self.ctrl.threading.Thread = ImmediateThread
+            self.ctrl.rotate_instance = lambda instance, force=False: calls.append((instance, force)) or {
+                "instance": instance,
+                "ok": True,
+                "outcome": self.ctrl.OUTCOME_SUCCESS,
+            }
+            self.ctrl.STATE.update_health("vpn_0", True, "1.1.1.1", status=self.ctrl.STATUS_HEALTHY)
+            self.ctrl.STATE.update_health("vpn_1", True, "2.2.2.2", status=self.ctrl.STATUS_HEALTHY)
+            self.ctrl.STATE.update_verified_proxy_ip("vpn_0", "45.134.140.5")
+            self.ctrl.STATE.update_verified_proxy_ip("vpn_1", "45.134.140.5")
+
+            self.ctrl.maybe_schedule_duplicate_ip_repair()
+        finally:
+            self.ctrl.threading.Thread = original_thread
+
+        self.assertEqual([("vpn_1", False)], calls)
+        self.assertEqual(1, self.ctrl.duplicate_repair_snapshot()["scheduled_total"])
 
     def test_duplicate_public_ip_refresh_schedules_one_repair_rotation(self):
         calls = []
@@ -449,6 +551,7 @@ class ControllerTests(unittest.TestCase):
         self.ctrl.STATE.update_health("vpn_0", True, "1.1.1.1", status=self.ctrl.STATUS_HEALTHY)
         self.ctrl.is_healthy = lambda instance: True
         self.ctrl.get_public_ip = lambda instance: "2.2.2.2"
+        self.ctrl.refresh_verified_proxy_ip = lambda instance, force=False: {"verified_proxy_ip": "2.2.2.2"}
         self.ctrl.sleep = lambda seconds: None
 
         result = self.ctrl.rotate_instance("vpn_0", force=True)

@@ -37,6 +37,9 @@ class VerifyLeakTests(unittest.TestCase):
                     "healthy": healthy,
                     "status": "healthy" if healthy else "down",
                     "public_ip": "45.134.140.5" if healthy else None,
+                    "verified_proxy_ip": "45.134.140.5" if healthy else None,
+                    "egress_state_fresh": healthy,
+                    "public_ip_mismatch": False,
                 }
             ]
         }
@@ -75,6 +78,35 @@ class VerifyLeakTests(unittest.TestCase):
         self.assertEqual("149.232.250.241", result["direct_ip"])
         self.assertEqual(1, result["verified_count"])
         self.assertFalse(result["instances"][0]["leak_detected"])
+        self.assertEqual("45.134.140.5", result["instances"][0]["controller_verified_proxy_ip"])
+        self.assertFalse(result["instances"][0]["controller_proxy_ip_mismatch"])
+
+    def test_verify_leaks_reports_controller_mismatch_without_failing_proxy_result(self):
+        self.chamosel.fetch_direct_ip = lambda target, timeout: ("149.232.250.241", {"ip": "149.232.250.241"})
+        self.chamosel.fetch_pool_state = lambda cfg: {
+            "instances": [
+                {
+                    "name": "surfshark_4",
+                    "healthy": True,
+                    "status": "healthy",
+                    "public_ip": "1.1.1.1",
+                    "verified_proxy_ip": "45.134.140.5",
+                    "egress_state_fresh": True,
+                    "public_ip_mismatch": True,
+                }
+            ]
+        }
+        self.chamosel.run_backend_probe = lambda instance, target, timeout: {"ip": "45.134.140.5"}
+
+        result = self.chamosel.verify_leaks(self.cfg)
+
+        self.assertTrue(result["ok"])
+        item = result["instances"][0]
+        self.assertEqual("1.1.1.1", item["controller_public_ip"])
+        self.assertEqual("45.134.140.5", item["controller_verified_proxy_ip"])
+        self.assertEqual("45.134.140.5", item["proxy_ip"])
+        self.assertTrue(item["controller_public_ip_mismatch"])
+        self.assertFalse(item["controller_proxy_ip_mismatch"])
 
     def test_verify_leaks_fails_when_backend_ip_equals_host(self):
         self.chamosel.fetch_direct_ip = lambda target, timeout: ("149.232.250.241", {"ip": "149.232.250.241"})
@@ -157,6 +189,10 @@ class VerifyLeakTests(unittest.TestCase):
                     "name": "surfshark_0",
                     "controller_status": "healthy",
                     "controller_public_ip": "45.134.140.5",
+                    "controller_verified_proxy_ip": "45.134.140.5",
+                    "controller_public_ip_mismatch": False,
+                    "controller_proxy_ip_mismatch": True,
+                    "controller_egress_state_fresh": True,
                     "proxy_ok": False,
                     "proxy_ip": "149.232.250.241",
                     "country": None,
@@ -199,6 +235,7 @@ class VerifyLeakTests(unittest.TestCase):
                         "name": "surfshark_0",
                         "controller_status": "healthy",
                         "controller_public_ip": "45.134.140.5",
+                        "controller_verified_proxy_ip": "45.134.140.5",
                         "proxy_ok": True,
                         "proxy_ip": "45.134.140.5",
                         "country": "United States",
@@ -375,6 +412,49 @@ class VerifyLeakTests(unittest.TestCase):
         self.assertEqual("repair_in_progress", report["repair_decision"]["action"])
         self.assertEqual(["surfshark_4"], report["repair_decision"]["targets"])
         self.assertIn("Repair decision: repair_in_progress", rendered)
+
+    def test_doctor_reports_verified_duplicate_ip_repair_requested(self):
+        decision = self.chamosel.doctor_repair_decision(
+            True,
+            {
+                "pool_status": "degraded",
+                "degraded_reasons": ["verified_duplicate_proxy_ip"],
+                "duplicate_repair": {
+                    "enabled": True,
+                    "in_flight": [],
+                    "backoff_remaining": {},
+                },
+            },
+        )
+
+        self.assertEqual("repair_requested", decision["action"])
+        self.assertEqual("verified_duplicate_proxy_ip", decision["reason"])
+
+    def test_doctor_reports_public_ip_mismatch_as_monitor_only(self):
+        decision = self.chamosel.doctor_repair_decision(
+            True,
+            {
+                "pool_status": "degraded",
+                "degraded_reasons": ["public_ip_mismatch"],
+                "duplicate_repair": {"enabled": True},
+            },
+        )
+
+        self.assertEqual("monitor", decision["action"])
+        self.assertEqual("public_ip_mismatch", decision["reason"])
+
+    def test_doctor_reports_egress_verification_failure_as_manual(self):
+        decision = self.chamosel.doctor_repair_decision(
+            True,
+            {
+                "pool_status": "degraded",
+                "degraded_reasons": ["egress_verification_failed"],
+                "duplicate_repair": {"enabled": True},
+            },
+        )
+
+        self.assertEqual("manual", decision["action"])
+        self.assertEqual("egress_verification_failed", decision["reason"])
 
     def test_doctor_reports_duplicate_ip_repair_backoff(self):
         decision = self.chamosel.doctor_repair_decision(

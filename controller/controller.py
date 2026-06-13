@@ -32,6 +32,10 @@ Environment:
   POOL_DEGRADED_MIN_HEALTHY min healthy backends before pool is degraded (auto)
   AUTO_REPAIR_DUPLICATE_IPS rotate one duplicate-IP backend after refresh (true)
   DUPLICATE_REPAIR_RETRY_COOLDOWN seconds before retrying failed duplicate repair (300)
+  EGRESS_VERIFY_TARGET target URL for backend proxy egress verification
+  EGRESS_VERIFY_TIMEOUT per-backend egress verification timeout seconds (10)
+  EGRESS_VERIFY_TTL max age for verified proxy IP cache seconds (120)
+  EGRESS_VERIFY_ON_FRESH verify backend proxy egress during /pool?fresh=1 (true)
   POLL_INTERVAL        background health/IP poll interval seconds (default 15)
   POLL_WORKERS         max concurrent instance polls (default min(16, pool size))
   STATE_FILE           path to persist state JSON (default /data/state.json)
@@ -49,6 +53,7 @@ Endpoints:
 
 import json
 import os
+import ipaddress
 import threading
 import time
 import urllib.error
@@ -73,6 +78,11 @@ ROTATE_ALL_BATCH_DELAY_SECONDS = max(0.0, float(os.environ.get("ROTATE_ALL_BATCH
 POOL_DEGRADED_MIN_HEALTHY = os.environ.get("POOL_DEGRADED_MIN_HEALTHY", "auto").strip().lower()
 AUTO_REPAIR_DUPLICATE_IPS = os.environ.get("AUTO_REPAIR_DUPLICATE_IPS", "true").strip().lower() not in ("0", "false", "no", "off")
 DUPLICATE_REPAIR_RETRY_COOLDOWN = max(0, int(os.environ.get("DUPLICATE_REPAIR_RETRY_COOLDOWN", "300")))
+GLUETUN_PROXY_PORT = int(os.environ.get("GLUETUN_PROXY_PORT", "8888"))
+EGRESS_VERIFY_TARGET = os.environ.get("EGRESS_VERIFY_TARGET", "https://ifconfig.co/json").strip()
+EGRESS_VERIFY_TIMEOUT = max(1, int(os.environ.get("EGRESS_VERIFY_TIMEOUT", "10")))
+EGRESS_VERIFY_TTL = max(0, int(os.environ.get("EGRESS_VERIFY_TTL", "120")))
+EGRESS_VERIFY_ON_FRESH = os.environ.get("EGRESS_VERIFY_ON_FRESH", "true").strip().lower() not in ("0", "false", "no", "off")
 POLL_WORKERS = int(os.environ.get("POLL_WORKERS", str(max(1, min(16, len(INSTANCES) or 1)))))
 
 STATUS_HEALTHY = "healthy"
@@ -104,6 +114,9 @@ POOL_STATUS_DOWN = "down"
 
 DEGRADED_STALE_STATE = "stale_state"
 DEGRADED_DUPLICATE_PUBLIC_IP = "duplicate_public_ip"
+DEGRADED_VERIFIED_DUPLICATE_PROXY_IP = "verified_duplicate_proxy_ip"
+DEGRADED_PUBLIC_IP_MISMATCH = "public_ip_mismatch"
+DEGRADED_EGRESS_VERIFICATION_FAILED = "egress_verification_failed"
 DEGRADED_TOO_FEW_HEALTHY = "too_few_healthy_backends"
 DEGRADED_RECOVERY_TIMEOUT = "recovery_timeout"
 DEGRADED_PROXY_FAILURE = "proxy_failure"
@@ -143,6 +156,9 @@ class State:
                 "state_fresh": False,
                 "last_error": None,
                 "public_ip": None,
+                "verified_proxy_ip": None,
+                "verified_proxy_ip_seen_at": 0.0,
+                "verified_proxy_ip_error": None,
                 "ip_history": [],          # most-recent-first
                 "rotations": 0,
                 "rotation_errors": 0,
@@ -181,7 +197,9 @@ class State:
                               "last_rotation_message", "last_rotation_old_ip",
                               "last_rotation_new_ip", "cooldown_started_at",
                               "cooldown_until", "cooldown_reason",
-                              "cooldown_attempt_count", "forced_bypass_count"):
+                              "cooldown_attempt_count", "forced_bypass_count",
+                              "verified_proxy_ip", "verified_proxy_ip_seen_at",
+                              "verified_proxy_ip_error"):
                         if k in s:
                             self.inst[name][k] = s[k]
                     self.inst[name]["state_fresh"] = False
@@ -222,6 +240,17 @@ class State:
                 if not s["ip_history"] or s["ip_history"][0] != ip:
                     s["ip_history"].insert(0, ip)
                     del s["ip_history"][IP_HISTORY_MAX:]
+            self._save_locked()
+
+    def update_verified_proxy_ip(self, name: str, ip: str | None, error: str | None = None):
+        with self.lock:
+            s = self.inst[name]
+            if ip:
+                s["verified_proxy_ip"] = ip
+                s["verified_proxy_ip_seen_at"] = time.time()
+                s["verified_proxy_ip_error"] = None
+            else:
+                s["verified_proxy_ip_error"] = error or "egress verification failed"
             self._save_locked()
 
     def record_rotation(
@@ -353,6 +382,21 @@ class State:
                     s["cooldown_until"] = 0.0
                     s["cooldown_reason"] = None
                 s["cooldown_remaining_seconds"] = round(remaining, 3)
+                seen_at = float(s.get("verified_proxy_ip_seen_at") or 0.0)
+                egress_fresh = (
+                    bool(s.get("verified_proxy_ip"))
+                    and not s.get("verified_proxy_ip_error")
+                    and EGRESS_VERIFY_TTL > 0
+                    and now - seen_at <= EGRESS_VERIFY_TTL
+                )
+                s["egress_state_fresh"] = egress_fresh
+                s["public_ip_mismatch"] = bool(
+                    s.get("healthy")
+                    and s.get("public_ip")
+                    and s.get("verified_proxy_ip")
+                    and egress_fresh
+                    and s.get("public_ip") != s.get("verified_proxy_ip")
+                )
                 instances.append(s)
             pool_status, degraded_reasons, state_fresh = pool_summary(instances)
             return {
@@ -380,27 +424,40 @@ def min_healthy_threshold() -> int:
         return len(INSTANCES)
 
 
-def duplicate_public_ips(instances: list[dict]) -> set[str]:
-    seen = set()
-    duplicates = set()
-    for s in instances:
-        ip = s.get("public_ip")
-        if not ip or not s.get("healthy"):
-            continue
-        if ip in seen:
-            duplicates.add(ip)
-        seen.add(ip)
-    return duplicates
+def pool_identity_ip(s: dict) -> tuple[str | None, str | None]:
+    if not s.get("healthy"):
+        return None, None
+    if s.get("verified_proxy_ip") and s.get("egress_state_fresh"):
+        return s.get("verified_proxy_ip"), "verified"
+    if s.get("public_ip"):
+        return s.get("public_ip"), "public"
+    return None, None
 
 
-def duplicate_groups(instances: list[dict]) -> dict[str, list[str]]:
+def duplicate_identity_groups(instances: list[dict]) -> dict[tuple[str, str], list[str]]:
     groups = {}
     for s in instances:
-        ip = s.get("public_ip")
-        if not ip or not s.get("healthy"):
+        ip, source = pool_identity_ip(s)
+        if not ip or not source:
             continue
-        groups.setdefault(ip, []).append(s["name"])
-    return {ip: names for ip, names in groups.items() if len(names) > 1}
+        groups.setdefault((source, ip), []).append(s["name"])
+    return {key: names for key, names in groups.items() if len(names) > 1}
+
+
+def verified_duplicate_proxy_ips(instances: list[dict]) -> set[str]:
+    return {
+        ip
+        for (source, ip), names in duplicate_identity_groups(instances).items()
+        if source == "verified"
+    }
+
+
+def duplicate_public_ips(instances: list[dict]) -> set[str]:
+    return {
+        ip
+        for (source, ip), names in duplicate_identity_groups(instances).items()
+        if source == "public"
+    }
 
 
 def duplicate_repair_snapshot() -> dict:
@@ -426,8 +483,14 @@ def pool_summary(instances: list[dict]) -> tuple[str, list[str], bool]:
 
     if not state_fresh:
         reasons.append(DEGRADED_STALE_STATE)
+    if verified_duplicate_proxy_ips(instances):
+        reasons.append(DEGRADED_VERIFIED_DUPLICATE_PROXY_IP)
     if duplicate_public_ips(instances):
         reasons.append(DEGRADED_DUPLICATE_PUBLIC_IP)
+    if any(s.get("public_ip_mismatch") for s in instances):
+        reasons.append(DEGRADED_PUBLIC_IP_MISMATCH)
+    if any(s.get("healthy") and s.get("verified_proxy_ip_error") and not s.get("egress_state_fresh") for s in instances):
+        reasons.append(DEGRADED_EGRESS_VERIFICATION_FAILED)
     if healthy_count < min_healthy_threshold():
         reasons.append(DEGRADED_TOO_FEW_HEALTHY)
 
@@ -470,6 +533,62 @@ def get_public_ip(instance: str):
         return _ctrl("GET", instance, "/v1/publicip/ip").get("public_ip") or None
     except Exception:
         return None
+
+
+def is_public_ip(value: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(str(value).strip())
+    except ValueError:
+        return False
+    return ip.is_global
+
+
+def extract_verified_proxy_ip(payload: dict) -> str:
+    if not isinstance(payload, dict):
+        raise ValueError("response is not a JSON object")
+    for key in ("ip", "query", "public_ip"):
+        value = payload.get(key)
+        if value and is_public_ip(str(value)):
+            return str(value).strip()
+    raise ValueError("response does not contain a public IP")
+
+
+def probe_verified_proxy_ip(instance: str) -> tuple[str | None, str | None]:
+    if not EGRESS_VERIFY_TARGET:
+        return None, "egress verification target is empty"
+    proxy = f"http://{instance}:{GLUETUN_PROXY_PORT}"
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+    )
+    req = urllib.request.Request(
+        EGRESS_VERIFY_TARGET,
+        headers={"accept": "application/json", "user-agent": "chamosel controller egress verifier"},
+    )
+    try:
+        with opener.open(req, timeout=EGRESS_VERIFY_TIMEOUT) as resp:
+            payload = json.load(resp)
+        return extract_verified_proxy_ip(payload), None
+    except Exception as e:
+        return None, str(e)
+
+
+def verified_proxy_ip_expired(s: dict) -> bool:
+    if not s.get("verified_proxy_ip") or s.get("verified_proxy_ip_error"):
+        return True
+    if EGRESS_VERIFY_TTL <= 0:
+        return True
+    return time.time() - float(s.get("verified_proxy_ip_seen_at") or 0.0) > EGRESS_VERIFY_TTL
+
+
+def refresh_verified_proxy_ip(instance: str, force: bool = False) -> dict:
+    current = next((s for s in STATE.snapshot()["instances"] if s["name"] == instance), {})
+    if not current.get("healthy"):
+        return {"instance": instance, "verified_proxy_ip": current.get("verified_proxy_ip"), "skipped": "unhealthy"}
+    if not force and not verified_proxy_ip_expired(current):
+        return {"instance": instance, "verified_proxy_ip": current.get("verified_proxy_ip"), "cached": True}
+    ip, error = probe_verified_proxy_ip(instance)
+    STATE.update_verified_proxy_ip(instance, ip, error)
+    return {"instance": instance, "verified_proxy_ip": ip, "error": error}
 
 
 def detect_status_path(instance: str, force: bool = False):
@@ -547,18 +666,21 @@ def is_healthy(instance: str) -> bool:
     return healthy
 
 
-def refresh_instance(instance: str) -> dict:
+def refresh_instance(instance: str, verify_egress: bool = False, force_egress: bool = False) -> dict:
     healthy, status, error = read_health(instance)
     ip = get_public_ip(instance) if healthy else None
     STATE.update_health(instance, healthy, ip, status=status, error=error)
-    return {"instance": instance, "healthy": healthy, "status": status, "error": error, "public_ip": ip}
+    result = {"instance": instance, "healthy": healthy, "status": status, "error": error, "public_ip": ip}
+    if healthy and verify_egress:
+        result["egress"] = refresh_verified_proxy_ip(instance, force=force_egress)
+    return result
 
 
 def select_duplicate_repair_candidate(snap: dict) -> tuple[str | None, str | None]:
     instances = snap.get("instances") or []
     by_name = {s["name"]: s for s in instances}
     now = time.time()
-    for ip, names in sorted(duplicate_groups(instances).items()):
+    for (source, ip), names in sorted(duplicate_identity_groups(instances).items()):
         candidates = names[1:]
         candidates.sort(
             key=lambda name: (
@@ -580,9 +702,9 @@ def select_duplicate_repair_candidate(snap: dict) -> tuple[str | None, str | Non
 
 def duplicate_repair_worker(instance: str, duplicate_ip: str):
     try:
-        log(f"duplicate-ip repair: rotating {instance} from duplicated IP {duplicate_ip}")
+        log(f"duplicate-egress repair: rotating {instance} from duplicated IP {duplicate_ip}")
         result = rotate_instance(instance, force=False)
-        log(f"duplicate-ip repair result: {result}")
+        log(f"duplicate-egress repair result: {result}")
         with DUPLICATE_REPAIR_LOCK:
             if result.get("ok"):
                 DUPLICATE_REPAIR_BACKOFF_UNTIL.pop(instance, None)
@@ -598,7 +720,10 @@ def maybe_schedule_duplicate_ip_repair():
     if not AUTO_REPAIR_DUPLICATE_IPS:
         return
     snap = STATE.snapshot()
-    if DEGRADED_DUPLICATE_PUBLIC_IP not in snap.get("degraded_reasons", []):
+    if not any(
+        reason in snap.get("degraded_reasons", [])
+        for reason in (DEGRADED_VERIFIED_DUPLICATE_PROXY_IP, DEGRADED_DUPLICATE_PUBLIC_IP)
+    ):
         return
     instance, duplicate_ip = select_duplicate_repair_candidate(snap)
     if not instance:
@@ -615,14 +740,17 @@ def maybe_schedule_duplicate_ip_repair():
     ).start()
 
 
-def refresh_instances(instances=None):
+def refresh_instances(instances=None, verify_egress: bool = False, force_egress: bool = False):
     instances = list(instances or INSTANCES)
     if not instances:
         return []
     workers = max(1, min(POLL_WORKERS, len(instances)))
     results = []
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        future_map = {pool.submit(refresh_instance, inst): inst for inst in instances}
+        future_map = {
+            pool.submit(refresh_instance, inst, verify_egress, force_egress): inst
+            for inst in instances
+        }
         for fut in as_completed(future_map):
             inst = future_map[fut]
             try:
@@ -635,12 +763,7 @@ def refresh_instances(instances=None):
 
 
 def verify_proxy_after_rotation(instance: str) -> tuple[bool, str | None]:
-    """Hook point for post-rotation proxy verification.
-
-    The controller stays stdlib-only and does not need external IP lookup here;
-    the CLI leak verifier remains the stronger end-to-end check. Tests can
-    replace this hook to verify proxy-failure handling.
-    """
+    """Hook point for post-rotation proxy verification before egress probing."""
     return True, None
 
 
@@ -655,6 +778,9 @@ def wait_for_recovery(instance: str, old_ip, timeout: int = ROTATION_RECOVERY_TI
                 proxy_ok, proxy_error = verify_proxy_after_rotation(instance)
                 if not proxy_ok:
                     return OUTCOME_PROXY_FAILURE, new_ip, proxy_error
+                verified = refresh_verified_proxy_ip(instance, force=True)
+                if verified.get("error"):
+                    return OUTCOME_PROXY_FAILURE, new_ip, verified.get("error")
                 return OUTCOME_SUCCESS, new_ip, None
             if new_ip and old_ip and new_ip == old_ip:
                 STATE.update_health(instance, True, new_ip, status=STATUS_HEALTHY)
@@ -902,6 +1028,10 @@ def render_metrics() -> str:
         "# TYPE chamosel_instance_rotation_cooldown_active gauge",
         "# HELP chamosel_instance_rotation_cooldown_remaining_seconds Per-instance rotation cooldown remaining seconds.",
         "# TYPE chamosel_instance_rotation_cooldown_remaining_seconds gauge",
+        "# HELP chamosel_instance_egress_state_fresh Per-instance verified proxy egress IP freshness.",
+        "# TYPE chamosel_instance_egress_state_fresh gauge",
+        "# HELP chamosel_instance_public_ip_mismatch Per-instance mismatch between gluetun public IP and verified proxy IP.",
+        "# TYPE chamosel_instance_public_ip_mismatch gauge",
     ]
     for outcome, value in snap.get("rotation_errors_by_outcome", {}).items():
         lines.append(f'chamosel_rotation_errors_by_outcome_total{{outcome="{outcome}"}} {value}')
@@ -927,6 +1057,8 @@ def render_metrics() -> str:
         remaining = s.get("cooldown_remaining_seconds") or 0
         lines.append(f'chamosel_instance_rotation_cooldown_active{{instance="{s["name"]}"}} {1 if remaining > 0 else 0}')
         lines.append(f'chamosel_instance_rotation_cooldown_remaining_seconds{{instance="{s["name"]}"}} {remaining}')
+        lines.append(f'chamosel_instance_egress_state_fresh{{instance="{s["name"]}"}} {1 if s.get("egress_state_fresh") else 0}')
+        lines.append(f'chamosel_instance_public_ip_mismatch{{instance="{s["name"]}"}} {1 if s.get("public_ip_mismatch") else 0}')
     return "\n".join(lines) + "\n"
 
 
@@ -947,6 +1079,7 @@ def render_dashboard() -> str:
         hist = ", ".join(s["ip_history"][:5]) or "-"
         state = s.get("status") or ("healthy" if s["healthy"] else "down")
         outcome = s.get("last_rotation_outcome") or "-"
+        mismatch = "yes" if s.get("public_ip_mismatch") else "no"
         cooldown = s.get("cooldown_remaining_seconds") or 0
         cooldown_text = f"{cooldown:.0f}s ({s.get('cooldown_reason')})" if cooldown > 0 else "-"
         rows.append(
@@ -954,6 +1087,8 @@ def render_dashboard() -> str:
             f'<td>{state}</td>'
             f'<td>{"yes" if s.get("state_fresh") else "no"}</td>'
             f'<td class="ip">{s["public_ip"] or "-"}</td>'
+            f'<td class="ip">{s.get("verified_proxy_ip") or "-"}</td>'
+            f'<td>{mismatch}</td>'
             f'<td>{s["rotations"]}</td><td>{last_rot}</td>'
             f'<td>{outcome}</td><td>{cooldown_text}</td>'
             f'<td class="hist">{hist}</td></tr>'
@@ -987,7 +1122,7 @@ def render_dashboard() -> str:
 <p class="sub">degraded reasons: {degraded}</p>
 <p><button onclick="fetch('/rotate',{{method:'POST'}}).then(()=>setTimeout(()=>location.reload(),1200))">Rotate one</button></p>
 <table>
-  <tr><th>instance</th><th>state</th><th>fresh</th><th>public ip</th><th>rotations</th><th>last rotated</th><th>outcome</th><th>cooldown</th><th>recent ips</th></tr>
+  <tr><th>instance</th><th>state</th><th>fresh</th><th>public ip</th><th>verified proxy ip</th><th>mismatch</th><th>rotations</th><th>last rotated</th><th>outcome</th><th>cooldown</th><th>recent ips</th></tr>
   {''.join(rows)}
 </table></body></html>"""
 
@@ -1020,7 +1155,7 @@ class Handler(BaseHTTPRequestHandler):
             self._raw(200, render_metrics().encode(), "text/plain; version=0.0.4")
         elif parsed.path == "/pool":
             if parse_qs(parsed.query).get("fresh"):
-                refresh_instances()
+                refresh_instances(verify_egress=EGRESS_VERIFY_ON_FRESH)
             self._json(200, STATE.snapshot())
         else:
             self._json(404, {"error": "not found"})
