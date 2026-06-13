@@ -109,6 +109,24 @@ class GenerateTests(unittest.TestCase):
         self.assertEqual([".env.local"], service["env_file"])
         self.assertNotIn("WIREGUARD_PRIVATE_KEY", service["environment"])
 
+    def test_controller_reliability_settings_render(self):
+        cfg = self.base_config()
+        cfg["global_settings"]["rotate_all_batch_size"] = 3
+        cfg["global_settings"]["rotate_all_batch_delay_seconds"] = 5
+        cfg["global_settings"]["pool_degraded_min_healthy"] = 2
+        cfg["global_settings"]["auto_repair_duplicate_ips"] = False
+        cfg["global_settings"]["duplicate_repair_retry_cooldown"] = 180
+
+        self.chamosel.generate(cfg)
+        compose = yaml.safe_load(Path("docker-compose.yml").read_text())
+        env = compose["services"]["controller"]["environment"]
+
+        self.assertEqual("3", env["ROTATE_ALL_BATCH_SIZE"])
+        self.assertEqual("5", env["ROTATE_ALL_BATCH_DELAY_SECONDS"])
+        self.assertEqual("2", env["POOL_DEGRADED_MIN_HEALTHY"])
+        self.assertEqual("false", env["AUTO_REPAIR_DUPLICATE_IPS"])
+        self.assertEqual("180", env["DUPLICATE_REPAIR_RETRY_COOLDOWN"])
+
     def test_cmd_up_pulls_runtime_images_by_default(self):
         calls = []
         self.chamosel.generate = lambda cfg: calls.append(("generate", None))

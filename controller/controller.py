@@ -27,6 +27,11 @@ Environment:
   AUTO_ROTATE_SECONDS  if >0, rotate one instance every N seconds (default 0)
   ROTATE_COOLDOWN      min seconds between rotations of the same instance (60)
   ROTATION_RECOVERY_TIMEOUT seconds to wait for healthy+changed IP rotation (30)
+  ROTATE_ALL_BATCH_SIZE max concurrent backends for /rotate/all batches (2)
+  ROTATE_ALL_BATCH_DELAY_SECONDS delay between /rotate/all batches (2)
+  POOL_DEGRADED_MIN_HEALTHY min healthy backends before pool is degraded (auto)
+  AUTO_REPAIR_DUPLICATE_IPS rotate one duplicate-IP backend after refresh (true)
+  DUPLICATE_REPAIR_RETRY_COOLDOWN seconds before retrying failed duplicate repair (300)
   POLL_INTERVAL        background health/IP poll interval seconds (default 15)
   POLL_WORKERS         max concurrent instance polls (default min(16, pool size))
   STATE_FILE           path to persist state JSON (default /data/state.json)
@@ -39,7 +44,7 @@ Endpoints:
   GET  /metrics                  Prometheus exposition format
   POST /rotate                   rotate one random eligible instance
   POST /rotate/<name>            rotate a named instance
-  POST /rotate/all               rotate every eligible instance (sequential)
+  POST /rotate/all               rotate every eligible instance in bounded batches
 """
 
 import json
@@ -63,6 +68,11 @@ STATE_FILE = os.environ.get("STATE_FILE", "/data/state.json")
 HTTP_TIMEOUT = 8
 IP_HISTORY_MAX = 10
 ROTATION_RECOVERY_TIMEOUT = int(os.environ.get("ROTATION_RECOVERY_TIMEOUT", "30"))
+ROTATE_ALL_BATCH_SIZE = max(1, int(os.environ.get("ROTATE_ALL_BATCH_SIZE", "2")))
+ROTATE_ALL_BATCH_DELAY_SECONDS = max(0.0, float(os.environ.get("ROTATE_ALL_BATCH_DELAY_SECONDS", "2")))
+POOL_DEGRADED_MIN_HEALTHY = os.environ.get("POOL_DEGRADED_MIN_HEALTHY", "auto").strip().lower()
+AUTO_REPAIR_DUPLICATE_IPS = os.environ.get("AUTO_REPAIR_DUPLICATE_IPS", "true").strip().lower() not in ("0", "false", "no", "off")
+DUPLICATE_REPAIR_RETRY_COOLDOWN = max(0, int(os.environ.get("DUPLICATE_REPAIR_RETRY_COOLDOWN", "300")))
 POLL_WORKERS = int(os.environ.get("POLL_WORKERS", str(max(1, min(16, len(INSTANCES) or 1)))))
 
 STATUS_HEALTHY = "healthy"
@@ -87,6 +97,22 @@ AGG_OUTCOME_SUCCESS = "success"
 AGG_OUTCOME_PARTIAL_SUCCESS = "partial_success"
 AGG_OUTCOME_ALL_SKIPPED = "all_skipped"
 AGG_OUTCOME_FAILED = "failed"
+
+POOL_STATUS_HEALTHY = "healthy"
+POOL_STATUS_DEGRADED = "degraded"
+POOL_STATUS_DOWN = "down"
+
+DEGRADED_STALE_STATE = "stale_state"
+DEGRADED_DUPLICATE_PUBLIC_IP = "duplicate_public_ip"
+DEGRADED_TOO_FEW_HEALTHY = "too_few_healthy_backends"
+DEGRADED_RECOVERY_TIMEOUT = "recovery_timeout"
+DEGRADED_PROXY_FAILURE = "proxy_failure"
+DEGRADED_HEALTHY_IP_UNCHANGED = "healthy_ip_unchanged"
+
+DUPLICATE_REPAIR_LOCK = threading.Lock()
+DUPLICATE_REPAIR_IN_FLIGHT = set()
+DUPLICATE_REPAIR_BACKOFF_UNTIL = {}
+DUPLICATE_REPAIR_SCHEDULED_TOTAL = 0
 
 # New control API (gluetun v3.41+) first, then legacy (v3.40 and older).
 STATUS_PATHS = ("/v1/vpn/status", "/v1/openvpn/status")
@@ -114,6 +140,7 @@ class State:
                 "name": name,
                 "healthy": False,
                 "status": STATUS_UNREACHABLE,
+                "state_fresh": False,
                 "last_error": None,
                 "public_ip": None,
                 "ip_history": [],          # most-recent-first
@@ -157,6 +184,7 @@ class State:
                               "cooldown_attempt_count", "forced_bypass_count"):
                         if k in s:
                             self.inst[name][k] = s[k]
+                    self.inst[name]["state_fresh"] = False
             self.rotations_total = saved.get("rotations_total", 0)
             self.rotation_errors_total = saved.get("rotation_errors_total", 0)
             self.rotation_errors_by_outcome = saved.get("rotation_errors_by_outcome", {})
@@ -186,6 +214,7 @@ class State:
             s = self.inst[name]
             s["healthy"] = healthy
             s["status"] = status or (STATUS_HEALTHY if healthy else STATUS_UNREACHABLE)
+            s["state_fresh"] = True
             s["last_error"] = error
             s["last_seen"] = time.time()
             if ip and ip != s["public_ip"]:
@@ -257,6 +286,7 @@ class State:
             s = self.inst[name]
             s["healthy"] = status == STATUS_HEALTHY
             s["status"] = status
+            s["state_fresh"] = True
             s["last_error"] = error
             s["last_seen"] = time.time()
             self._save_locked()
@@ -281,9 +311,11 @@ class State:
             reason = s.get("cooldown_reason")
             if remaining > 0 and not reason and s.get("last_rotated"):
                 reason = OUTCOME_COOLDOWN
+            if remaining <= 0:
+                reason = None
             return {
                 "cooldown_started_at": s.get("cooldown_started_at", 0.0),
-                "cooldown_until": s.get("cooldown_until", 0.0),
+                "cooldown_until": s.get("cooldown_until", 0.0) if remaining > 0 else 0.0,
                 "cooldown_remaining_seconds": round(remaining, 3),
                 "cooldown_reason": reason,
                 "cooldown_attempt_count": s.get("cooldown_attempt_count", 0),
@@ -317,16 +349,101 @@ class State:
                 remaining = max(success_remaining, failure_remaining)
                 if remaining > 0 and not s.get("cooldown_reason") and s.get("last_rotated"):
                     s["cooldown_reason"] = OUTCOME_COOLDOWN
+                if remaining <= 0:
+                    s["cooldown_until"] = 0.0
+                    s["cooldown_reason"] = None
                 s["cooldown_remaining_seconds"] = round(remaining, 3)
                 instances.append(s)
+            pool_status, degraded_reasons, state_fresh = pool_summary(instances)
             return {
                 "count": len(INSTANCES),
                 "healthy": sum(1 for s in self.inst.values() if s["healthy"]),
+                "pool_status": pool_status,
+                "state_fresh": state_fresh,
+                "degraded_reasons": degraded_reasons,
+                "duplicate_repair": duplicate_repair_snapshot(),
                 "rotations_total": self.rotations_total,
                 "rotation_errors_total": self.rotation_errors_total,
                 "rotation_errors_by_outcome": dict(self.rotation_errors_by_outcome),
                 "instances": instances,
             }
+
+
+def min_healthy_threshold() -> int:
+    if not INSTANCES:
+        return 0
+    if POOL_DEGRADED_MIN_HEALTHY in ("", "auto"):
+        return len(INSTANCES)
+    try:
+        return max(1, min(len(INSTANCES), int(POOL_DEGRADED_MIN_HEALTHY)))
+    except ValueError:
+        return len(INSTANCES)
+
+
+def duplicate_public_ips(instances: list[dict]) -> set[str]:
+    seen = set()
+    duplicates = set()
+    for s in instances:
+        ip = s.get("public_ip")
+        if not ip or not s.get("healthy"):
+            continue
+        if ip in seen:
+            duplicates.add(ip)
+        seen.add(ip)
+    return duplicates
+
+
+def duplicate_groups(instances: list[dict]) -> dict[str, list[str]]:
+    groups = {}
+    for s in instances:
+        ip = s.get("public_ip")
+        if not ip or not s.get("healthy"):
+            continue
+        groups.setdefault(ip, []).append(s["name"])
+    return {ip: names for ip, names in groups.items() if len(names) > 1}
+
+
+def duplicate_repair_snapshot() -> dict:
+    now = time.time()
+    with DUPLICATE_REPAIR_LOCK:
+        return {
+            "enabled": AUTO_REPAIR_DUPLICATE_IPS,
+            "in_flight": sorted(DUPLICATE_REPAIR_IN_FLIGHT),
+            "retry_cooldown_seconds": DUPLICATE_REPAIR_RETRY_COOLDOWN,
+            "backoff_remaining": {
+                name: round(max(0.0, until - now), 3)
+                for name, until in sorted(DUPLICATE_REPAIR_BACKOFF_UNTIL.items())
+                if until > now
+            },
+            "scheduled_total": DUPLICATE_REPAIR_SCHEDULED_TOTAL,
+        }
+
+
+def pool_summary(instances: list[dict]) -> tuple[str, list[str], bool]:
+    state_fresh = bool(instances) and all(bool(s.get("state_fresh")) for s in instances)
+    healthy_count = sum(1 for s in instances if s.get("healthy"))
+    reasons = []
+
+    if not state_fresh:
+        reasons.append(DEGRADED_STALE_STATE)
+    if duplicate_public_ips(instances):
+        reasons.append(DEGRADED_DUPLICATE_PUBLIC_IP)
+    if healthy_count < min_healthy_threshold():
+        reasons.append(DEGRADED_TOO_FEW_HEALTHY)
+
+    latest_outcomes = {s.get("last_rotation_outcome") for s in instances}
+    if OUTCOME_RECOVERY_TIMEOUT in latest_outcomes:
+        reasons.append(DEGRADED_RECOVERY_TIMEOUT)
+    if OUTCOME_PROXY_FAILURE in latest_outcomes:
+        reasons.append(DEGRADED_PROXY_FAILURE)
+    if OUTCOME_HEALTHY_IP_UNCHANGED in latest_outcomes:
+        reasons.append(DEGRADED_HEALTHY_IP_UNCHANGED)
+
+    if healthy_count == 0:
+        return POOL_STATUS_DOWN, sorted(set(reasons)), state_fresh
+    if reasons:
+        return POOL_STATUS_DEGRADED, sorted(set(reasons)), state_fresh
+    return POOL_STATUS_HEALTHY, [], state_fresh
 
 
 STATE = State()
@@ -437,6 +554,67 @@ def refresh_instance(instance: str) -> dict:
     return {"instance": instance, "healthy": healthy, "status": status, "error": error, "public_ip": ip}
 
 
+def select_duplicate_repair_candidate(snap: dict) -> tuple[str | None, str | None]:
+    instances = snap.get("instances") or []
+    by_name = {s["name"]: s for s in instances}
+    now = time.time()
+    for ip, names in sorted(duplicate_groups(instances).items()):
+        candidates = names[1:]
+        candidates.sort(
+            key=lambda name: (
+                0 if by_name[name].get("last_rotation_outcome") != OUTCOME_SUCCESS else 1,
+                by_name[name].get("last_rotated") or 0,
+            )
+        )
+        for name in candidates:
+            if STATE.cooldown_remaining(name) > 0:
+                continue
+            with DUPLICATE_REPAIR_LOCK:
+                if name in DUPLICATE_REPAIR_IN_FLIGHT:
+                    continue
+                if DUPLICATE_REPAIR_BACKOFF_UNTIL.get(name, 0.0) > now:
+                    continue
+            return name, ip
+    return None, None
+
+
+def duplicate_repair_worker(instance: str, duplicate_ip: str):
+    try:
+        log(f"duplicate-ip repair: rotating {instance} from duplicated IP {duplicate_ip}")
+        result = rotate_instance(instance, force=False)
+        log(f"duplicate-ip repair result: {result}")
+        with DUPLICATE_REPAIR_LOCK:
+            if result.get("ok"):
+                DUPLICATE_REPAIR_BACKOFF_UNTIL.pop(instance, None)
+            elif DUPLICATE_REPAIR_RETRY_COOLDOWN > 0:
+                DUPLICATE_REPAIR_BACKOFF_UNTIL[instance] = time.time() + DUPLICATE_REPAIR_RETRY_COOLDOWN
+    finally:
+        with DUPLICATE_REPAIR_LOCK:
+            DUPLICATE_REPAIR_IN_FLIGHT.discard(instance)
+
+
+def maybe_schedule_duplicate_ip_repair():
+    global DUPLICATE_REPAIR_SCHEDULED_TOTAL
+    if not AUTO_REPAIR_DUPLICATE_IPS:
+        return
+    snap = STATE.snapshot()
+    if DEGRADED_DUPLICATE_PUBLIC_IP not in snap.get("degraded_reasons", []):
+        return
+    instance, duplicate_ip = select_duplicate_repair_candidate(snap)
+    if not instance:
+        return
+    with DUPLICATE_REPAIR_LOCK:
+        if instance in DUPLICATE_REPAIR_IN_FLIGHT:
+            return
+        DUPLICATE_REPAIR_IN_FLIGHT.add(instance)
+        DUPLICATE_REPAIR_SCHEDULED_TOTAL += 1
+    threading.Thread(
+        target=duplicate_repair_worker,
+        args=(instance, duplicate_ip),
+        daemon=True,
+    ).start()
+
+
 def refresh_instances(instances=None):
     instances = list(instances or INSTANCES)
     if not instances:
@@ -452,6 +630,7 @@ def refresh_instances(instances=None):
             except Exception as e:
                 STATE.update_health(inst, False, None, status=STATUS_UNREACHABLE, error=str(e))
                 results.append({"instance": inst, "healthy": False, "status": STATUS_UNREACHABLE, "error": str(e)})
+    maybe_schedule_duplicate_ip_repair()
     return results
 
 
@@ -600,13 +779,32 @@ def rotate_all(force: bool = False) -> dict:
             skipped.append(skipped_cooldown_response(inst, started_at))
         else:
             eligible.append(inst)
-    for inst in eligible:
-        results.append(rotate_instance(inst, force=force))
+
+    batches = [
+        eligible[i:i + ROTATE_ALL_BATCH_SIZE]
+        for i in range(0, len(eligible), ROTATE_ALL_BATCH_SIZE)
+    ]
+    for index, batch in enumerate(batches):
+        with ThreadPoolExecutor(max_workers=max(1, len(batch))) as pool:
+            future_map = {pool.submit(rotate_instance, inst, force=force): inst for inst in batch}
+            for fut in as_completed(future_map):
+                inst = future_map[fut]
+                try:
+                    results.append(fut.result())
+                except Exception as e:
+                    STATE.record_rotation(inst, OUTCOME_COMMAND_ERROR, message=str(e))
+                    results.append(
+                        rotation_response(inst, False, OUTCOME_COMMAND_ERROR, started_at, message=str(e))
+                    )
+        if index < len(batches) - 1 and ROTATE_ALL_BATCH_DELAY_SECONDS > 0:
+            sleep(ROTATE_ALL_BATCH_DELAY_SECONDS)
+
     all_results = skipped + results
     success_count = sum(1 for r in all_results if r.get("outcome") == OUTCOME_SUCCESS)
     unchanged_count = sum(1 for r in all_results if r.get("outcome") == OUTCOME_HEALTHY_IP_UNCHANGED)
     skipped_count = sum(1 for r in all_results if r.get("outcome") == OUTCOME_COOLDOWN)
     failure_count = sum(1 for r in all_results if not r.get("ok") and r.get("outcome") != OUTCOME_COOLDOWN)
+    timed_out_count = sum(1 for r in all_results if r.get("outcome") == OUTCOME_RECOVERY_TIMEOUT)
     cooldown_count = sum(1 for i in INSTANCES if STATE.cooldown_remaining(i) > 0)
     if all_results and success_count == len(all_results):
         outcome = AGG_OUTCOME_SUCCESS
@@ -626,9 +824,13 @@ def rotate_all(force: bool = False) -> dict:
         "elapsed_seconds": round(time.monotonic() - started_at, 3),
         "eligible_count": len(eligible),
         "skipped_count": skipped_count,
+        "batch_count": len(batches),
+        "batch_size": ROTATE_ALL_BATCH_SIZE,
+        "batch_delay_seconds": ROTATE_ALL_BATCH_DELAY_SECONDS,
         "success_count": success_count,
         "unchanged_count": unchanged_count,
         "failure_count": failure_count,
+        "timed_out_count": timed_out_count,
         "cooldown_count": cooldown_count,
         "results": all_results,
     }
@@ -665,6 +867,19 @@ def render_metrics() -> str:
         "# HELP chamosel_instances_healthy Number of healthy instances.",
         "# TYPE chamosel_instances_healthy gauge",
         f"chamosel_instances_healthy {snap['healthy']}",
+        "# HELP chamosel_pool_status Pool aggregate status label (1=current status).",
+        "# TYPE chamosel_pool_status gauge",
+        "# HELP chamosel_pool_degraded_reason Pool degraded reason labels (1=active reason).",
+        "# TYPE chamosel_pool_degraded_reason gauge",
+        "# HELP chamosel_state_fresh Whether every instance has been live-refreshed since controller start.",
+        "# TYPE chamosel_state_fresh gauge",
+        f"chamosel_state_fresh {1 if snap.get('state_fresh') else 0}",
+        "# HELP chamosel_duplicate_ip_repair_in_flight Number of duplicate-IP repair rotations in flight.",
+        "# TYPE chamosel_duplicate_ip_repair_in_flight gauge",
+        f"chamosel_duplicate_ip_repair_in_flight {len((snap.get('duplicate_repair') or {}).get('in_flight') or [])}",
+        "# HELP chamosel_duplicate_ip_repair_scheduled_total Total duplicate-IP repair rotations scheduled.",
+        "# TYPE chamosel_duplicate_ip_repair_scheduled_total counter",
+        f"chamosel_duplicate_ip_repair_scheduled_total {(snap.get('duplicate_repair') or {}).get('scheduled_total') or 0}",
         "# HELP chamosel_rotations_total Total successful rotations.",
         "# TYPE chamosel_rotations_total counter",
         f"chamosel_rotations_total {snap['rotations_total']}",
@@ -690,6 +905,10 @@ def render_metrics() -> str:
     ]
     for outcome, value in snap.get("rotation_errors_by_outcome", {}).items():
         lines.append(f'chamosel_rotation_errors_by_outcome_total{{outcome="{outcome}"}} {value}')
+    for status in (POOL_STATUS_HEALTHY, POOL_STATUS_DEGRADED, POOL_STATUS_DOWN):
+        lines.append(f'chamosel_pool_status{{status="{status}"}} {1 if snap.get("pool_status") == status else 0}')
+    for reason in snap.get("degraded_reasons", []):
+        lines.append(f'chamosel_pool_degraded_reason{{reason="{reason}"}} 1')
     for s in snap["instances"]:
         lines.append(f'chamosel_instance_healthy{{instance="{s["name"]}"}} {1 if s["healthy"] else 0}')
         lines.append(f'chamosel_instance_status{{instance="{s["name"]}",status="{s["status"]}"}} 1')
@@ -715,6 +934,13 @@ def render_dashboard() -> str:
     snap = STATE.snapshot()
     now = time.time()
     rows = []
+    pool_status = snap.get("pool_status", POOL_STATUS_DOWN)
+    status_color = {
+        POOL_STATUS_HEALTHY: "#22c55e",
+        POOL_STATUS_DEGRADED: "#f59e0b",
+        POOL_STATUS_DOWN: "#ef4444",
+    }.get(pool_status, "#9ca3af")
+    degraded = ", ".join(snap.get("degraded_reasons") or []) or "-"
     for s in snap["instances"]:
         dot = "#22c55e" if s["healthy"] else "#ef4444"
         last_rot = "never" if not s["last_rotated"] else f"{int(now - s['last_rotated'])}s ago"
@@ -726,6 +952,7 @@ def render_dashboard() -> str:
         rows.append(
             f'<tr><td><span class="dot" style="background:{dot}"></span>{s["name"]}</td>'
             f'<td>{state}</td>'
+            f'<td>{"yes" if s.get("state_fresh") else "no"}</td>'
             f'<td class="ip">{s["public_ip"] or "-"}</td>'
             f'<td>{s["rotations"]}</td><td>{last_rot}</td>'
             f'<td>{outcome}</td><td>{cooldown_text}</td>'
@@ -739,6 +966,7 @@ def render_dashboard() -> str:
   .cards{{display:flex;gap:12px;margin-bottom:20px;flex-wrap:wrap}}
   .card{{background:#111827;border:1px solid #1f2937;border-radius:10px;padding:12px 16px;min-width:120px}}
   .card .n{{font-size:24px;font-weight:600}} .card .l{{color:#9ca3af;font-size:12px}}
+  .status{{color:{status_color}}}
   table{{width:100%;border-collapse:collapse;background:#111827;border-radius:10px;overflow:hidden}}
   th,td{{text-align:left;padding:10px 14px;border-bottom:1px solid #1f2937}}
   th{{color:#9ca3af;font-weight:500;font-size:12px;text-transform:uppercase;letter-spacing:.04em}}
@@ -751,12 +979,15 @@ def render_dashboard() -> str:
 <div class="cards">
   <div class="card"><div class="n">{snap['count']}</div><div class="l">instances</div></div>
   <div class="card"><div class="n">{snap['healthy']}</div><div class="l">healthy</div></div>
+  <div class="card"><div class="n status">{pool_status}</div><div class="l">pool</div></div>
+  <div class="card"><div class="n">{"yes" if snap.get("state_fresh") else "no"}</div><div class="l">fresh</div></div>
   <div class="card"><div class="n">{snap['rotations_total']}</div><div class="l">rotations</div></div>
   <div class="card"><div class="n">{snap['rotation_errors_total']}</div><div class="l">rot. errors</div></div>
 </div>
+<p class="sub">degraded reasons: {degraded}</p>
 <p><button onclick="fetch('/rotate',{{method:'POST'}}).then(()=>setTimeout(()=>location.reload(),1200))">Rotate one</button></p>
 <table>
-  <tr><th>instance</th><th>state</th><th>public ip</th><th>rotations</th><th>last rotated</th><th>outcome</th><th>cooldown</th><th>recent ips</th></tr>
+  <tr><th>instance</th><th>state</th><th>fresh</th><th>public ip</th><th>rotations</th><th>last rotated</th><th>outcome</th><th>cooldown</th><th>recent ips</th></tr>
   {''.join(rows)}
 </table></body></html>"""
 

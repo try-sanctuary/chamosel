@@ -51,8 +51,20 @@ curl -x http://localhost:8888 https://ipinfo.io/ip
 | `chamosel.py down` | Stop the stack (volumes preserved) |
 | `chamosel.py status` | Health + public IP + rotation count per instance |
 | `chamosel.py rotate [name\|all]` | Ask the controller to rotate |
+| `chamosel.py doctor` | Diagnose compose/controller/pool/stats/env/image freshness state |
 | `chamosel.py verify-leaks` | Verify backend proxy exit IPs do not expose the host IP |
 | `chamosel.py stress` | Repeat leak-only or rotation stress validation |
+
+## Doctor
+
+`doctor` is the fast operator check for the running stack:
+
+```bash
+python3 chamosel.py doctor
+python3 chamosel.py doctor --json
+```
+
+It checks Docker Compose visibility, controller `/health`, a fresh `/pool?fresh=1`, HAProxy stats port reachability, healthy backend count, image freshness mode, and whether `.env.local` exists. It reports paths and booleans only, not secret values. When the pool is degraded, `doctor` also reports a `repair_decision`: for duplicate public IPs this reflects the controller repair action triggered by the fresh pool check, an in-flight repair, or retry backoff.
 
 ## Leak Verification
 
@@ -92,7 +104,7 @@ Leak-only stress repeats leak verification without rotating tunnels:
 python3 chamosel.py stress --iterations 100 --mode leak-only
 ```
 
-Rotation stress exercises `POST /rotate/all` and summarizes partial success, cooldown skips, and per-backend outcomes:
+Rotation stress exercises batched `POST /rotate/all` and summarizes partial success, cooldown skips, and per-backend outcomes:
 
 ```bash
 python3 chamosel.py stress --iterations 10 --mode rotation
@@ -100,7 +112,13 @@ python3 chamosel.py stress --iterations 10 --mode rotation
 
 Use `--out-dir ./stress-results` to write `summary.json`. Rotation stress verifies leaks after each rotation by default; add `--no-verify` when you only want to exercise controller rotation behavior.
 
-For Surfshark-style live testing, start conservatively with `num_containers: 5`. Larger pools can work, but frequent mass rotation may hit provider recovery limits. `rotate/all` now skips backends in cooldown and continues with eligible backends instead of repeatedly retrying the same failing tunnel.
+Use the three validation commands for different jobs:
+
+- `doctor`: fast local stack diagnostics, no external leak target.
+- `verify-leaks`: one end-to-end proxy leak check for each healthy backend.
+- `stress`: repeated validation, optionally with cautious rotation.
+
+For Surfshark-style live testing, start conservatively with `num_containers: 5`, `rotate_cooldown: 60`, and `rotation_recovery_timeout: 60` to `90`. Larger pools can work, but frequent mass rotation may hit provider recovery limits. `rotate/all` skips backends in cooldown, rotates eligible backends in small batches, and continues when one backend times out. Duplicate public IPs are treated as degraded; after a fresh health check the controller schedules one background repair rotation for a duplicate backend when it is not in cooldown. If repair fails, `duplicate_repair_retry_cooldown` prevents immediate retry loops.
 
 ## REST API (controller, port 8800)
 
@@ -113,7 +131,7 @@ For Surfshark-style live testing, start conservatively with `num_containers: 5`.
 | GET | `/metrics` | Prometheus exposition format |
 | POST | `/rotate` | Rotate one random eligible instance (respects cooldown) |
 | POST | `/rotate/<name>` | Rotate a named instance (forced) |
-| POST | `/rotate/all` | Rotate every eligible instance sequentially and summarize partial results |
+| POST | `/rotate/all` | Rotate every eligible instance in bounded batches and summarize partial results |
 
 ```bash
 curl localhost:8800/pool | jq
@@ -126,6 +144,9 @@ curl localhost:8800/metrics
 ```
 chamosel_instances_total
 chamosel_instances_healthy
+chamosel_pool_status{status="healthy|degraded|down"}
+chamosel_pool_degraded_reason{reason="..."}
+chamosel_state_fresh
 chamosel_rotations_total
 chamosel_rotation_errors_total
 chamosel_rotation_errors_by_outcome_total{outcome="..."}
@@ -153,6 +174,11 @@ global_settings:
   auto_rotate_seconds: 0     # 0 = off; e.g. 1800 = rotate one every 30 min
   rotate_cooldown: 60        # min seconds between rotations of same instance
   rotation_recovery_timeout: 30
+  rotate_all_batch_size: 2
+  rotate_all_batch_delay_seconds: 2
+  pool_degraded_min_healthy: auto
+  auto_repair_duplicate_ips: true
+  duplicate_repair_retry_cooldown: 300
   poll_interval: 15          # background health/IP poll interval
   # api_key: ""              # optional local gluetun control-server key
 
@@ -181,6 +207,8 @@ $res = $client->fetchWithRetry('https://example.com/products');
 
 - **Per-request IP rotation:** with `mode tcp`, one keep-alive connection pins one exit IP. Set `CURLOPT_FRESH_CONNECT` in PHP (already done in the example) or use `balance leastconn`.
 - **After rotation:** the controller waits up to `rotation_recovery_timeout` seconds for a healthy tunnel and changed public IP. If recovery times out, `/rotate` returns `ok: false` with outcome `recovery_timeout` and starts a cooldown for mass/automatic rotation. If the tunnel is healthy but the IP did not change, the outcome is `healthy_ip_unchanged`.
+- **Pool status:** `/pool`, `/metrics`, `status`, and the dashboard expose `pool_status` as `healthy`, `degraded`, or `down`. The pool is degraded when state is stale after controller restart, too few backends are healthy, duplicate public IPs are detected, or recent rotation recovery/proxy checks failed. With `auto_repair_duplicate_ips: true`, duplicate-IP detection after polling or `/pool?fresh=1` schedules one non-forced background rotation for a duplicate backend, respecting cooldown and `duplicate_repair_retry_cooldown`.
+- **Mass rotation:** `/rotate/all` rotates eligible backends in batches. The defaults are `rotate_all_batch_size: 2` and `rotate_all_batch_delay_seconds: 2`; keep `rotate_cooldown > 0` for live providers so repeated recovery failures back off instead of hammering the same account.
 - **Control API key:** `api_key` is not a paid gluetun key and not a provider subscription key. It is a local secret shared between gluetun's control server and the chamosel controller. If you set it in `config.yml`, `generate` writes the same value to `.env` so Docker Compose can pass it to the controller. If `.env` and `config.yml` disagree, generation fails instead of creating a split-brain auth setup.
 - **Provider secrets:** keep VPN credentials out of `config.yml` when possible. Copy `.env.example` to `.env.local`, set `global_settings.env_file: .env.local`, and put values such as `WIREGUARD_PRIVATE_KEY` there. `.env.local` is ignored by Git.
 - **Image freshness:** `chamosel.py up` runs `docker compose pull --ignore-buildable` before starting the stack so runtime images such as gluetun do not silently stay stale. Use `chamosel.py up --no-pull` when you intentionally want to use only local cached images.

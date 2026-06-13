@@ -27,6 +27,7 @@ import ipaddress
 import json
 import logging
 import os
+import socket
 import secrets
 import subprocess
 import sys
@@ -64,6 +65,11 @@ DEFAULTS = {
     "auto_rotate_seconds": 0,
     "rotate_cooldown": 60,
     "rotation_recovery_timeout": 30,
+    "rotate_all_batch_size": 2,
+    "rotate_all_batch_delay_seconds": 2,
+    "pool_degraded_min_healthy": "auto",
+    "auto_repair_duplicate_ips": True,
+    "duplicate_repair_retry_cooldown": 300,
     "poll_interval": 15,
 }
 
@@ -214,6 +220,11 @@ def generate(cfg: dict):
         auto_rotate=gset(cfg, "auto_rotate_seconds"),
         rotate_cooldown=gset(cfg, "rotate_cooldown"),
         rotation_recovery_timeout=gset(cfg, "rotation_recovery_timeout"),
+        rotate_all_batch_size=gset(cfg, "rotate_all_batch_size"),
+        rotate_all_batch_delay_seconds=gset(cfg, "rotate_all_batch_delay_seconds"),
+        pool_degraded_min_healthy=gset(cfg, "pool_degraded_min_healthy"),
+        auto_repair_duplicate_ips=str(gset(cfg, "auto_repair_duplicate_ips")).lower(),
+        duplicate_repair_retry_cooldown=gset(cfg, "duplicate_repair_retry_cooldown"),
         poll_interval=gset(cfg, "poll_interval"),
         auth_default_role=auth_role,
         gluetun_health_port=GLUETUN_HEALTH_PORT,
@@ -245,6 +256,27 @@ def compose_cmd(args: list, capture=False):
         log.error("compose %s failed: %s", " ".join(args), e.stderr or e.stdout); sys.exit(1)
 
 
+def compose_check(args: list, timeout: int = 15) -> dict:
+    try:
+        r = subprocess.run(
+            ["docker", "compose", "-f", COMPOSE_FILE] + args,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=timeout,
+        )
+        return {
+            "ok": r.returncode == 0,
+            "returncode": r.returncode,
+            "stdout": (r.stdout or "").strip(),
+            "stderr": (r.stderr or "").strip(),
+        }
+    except FileNotFoundError:
+        return {"ok": False, "returncode": None, "stdout": "", "stderr": "docker not found"}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "returncode": None, "stdout": "", "stderr": "docker compose timed out"}
+
+
 class LeakVerificationError(Exception):
     """Operator-safe verification failure."""
 
@@ -261,6 +293,24 @@ def api_call(cfg: dict, method: str, path: str, timeout: int = 15):
         return json.load(urllib.request.urlopen(req, timeout=timeout))
     except Exception as e:
         log.error("controller call %s %s failed: %s", method, path, e); sys.exit(1)
+
+
+def api_call_result(cfg: dict, method: str, path: str, timeout: int = 15) -> dict:
+    url = f"http://localhost:{gset(cfg, 'api_port')}{path}"
+    req = urllib.request.Request(url, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return {"ok": True, "status": resp.status, "payload": json.load(resp), "error": None}
+    except Exception as e:
+        return {"ok": False, "status": None, "payload": None, "error": str(e)}
+
+
+def tcp_check(host: str, port: int, timeout: int = 2) -> dict:
+    try:
+        with socket.create_connection((host, int(port)), timeout=timeout):
+            return {"ok": True, "error": None}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 
 def is_public_ip(value: str) -> bool:
@@ -627,6 +677,177 @@ def run_stress(
     return report
 
 
+def doctor_report(cfg: dict) -> dict:
+    configured_instances = sum(1 for _ in iter_instances(cfg))
+    env_file = str(gset(cfg, "env_file") or "").strip()
+    env_local_exists = os.path.exists(".env.local")
+    configured_env_file_exists = bool(env_file) and os.path.exists(env_file)
+
+    compose = compose_check(["ps"])
+    health = api_call_result(cfg, "GET", "/health", timeout=5)
+    pool = api_call_result(cfg, "GET", "/pool?fresh=1", timeout=15)
+    stats = tcp_check("127.0.0.1", int(gset(cfg, "stats_port")), timeout=2)
+
+    pool_payload = pool.get("payload") if isinstance(pool.get("payload"), dict) else {}
+    healthy_count = int(pool_payload.get("healthy") or 0)
+    backend_count = int(pool_payload.get("count") or configured_instances)
+    pool_status = pool_payload.get("pool_status") or ("healthy" if healthy_count == backend_count and backend_count else "down")
+    pool_fresh_ok = pool["ok"] and pool_status == "healthy" and bool(pool_payload.get("state_fresh"))
+    repair_decision = doctor_repair_decision(pool["ok"], pool_payload)
+    checks = {
+        "compose_stack": {
+            "ok": compose["ok"],
+            "returncode": compose["returncode"],
+            "error": compose["stderr"] if not compose["ok"] else None,
+        },
+        "controller_health": {
+            "ok": health["ok"] and (health.get("payload") or {}).get("status") == "ok",
+            "error": health["error"],
+        },
+        "pool_fresh": {
+            "ok": pool_fresh_ok,
+            "pool_status": pool_status,
+            "state_fresh": bool(pool_payload.get("state_fresh")),
+            "healthy_backends": healthy_count,
+            "backend_count": backend_count,
+            "degraded_reasons": pool_payload.get("degraded_reasons") or [],
+            "error": pool["error"],
+        },
+        "haproxy_stats_port": {
+            "ok": stats["ok"],
+            "bind": "127.0.0.1",
+            "port": int(gset(cfg, "stats_port")),
+            "error": stats["error"],
+        },
+        "env_local": {
+            "ok": env_local_exists,
+            "path": ".env.local",
+            "configured_env_file": env_file or None,
+            "configured_env_file_exists": configured_env_file_exists,
+        },
+        "image_freshness": {
+            "ok": True,
+            "up_pulls_images_by_default": True,
+            "skip_flag": "--no-pull",
+        },
+    }
+    ok = (
+        checks["compose_stack"]["ok"]
+        and checks["controller_health"]["ok"]
+        and checks["pool_fresh"]["ok"]
+        and healthy_count > 0
+        and checks["haproxy_stats_port"]["ok"]
+    )
+    return {
+        "ok": ok,
+        "configured_instances": configured_instances,
+        "pool_status": pool_status,
+        "healthy_backends": healthy_count,
+        "backend_count": backend_count,
+        "repair_decision": repair_decision,
+        "checks": checks,
+    }
+
+
+def doctor_repair_decision(pool_ok: bool, pool_payload: dict) -> dict:
+    if not pool_ok:
+        return {
+            "action": "none",
+            "reason": "pool_unavailable",
+            "message": "pool state unavailable; repair decision not possible",
+        }
+
+    reasons = pool_payload.get("degraded_reasons") or []
+    if pool_payload.get("pool_status") == "healthy" and not reasons:
+        return {
+            "action": "none",
+            "reason": "pool_healthy",
+            "message": "pool is healthy; no repair needed",
+        }
+
+    duplicate_repair = pool_payload.get("duplicate_repair") or {}
+    if "duplicate_public_ip" in reasons:
+        if not duplicate_repair.get("enabled", False):
+            return {
+                "action": "manual",
+                "reason": "duplicate_repair_disabled",
+                "message": "duplicate public IP detected, but automatic repair is disabled",
+            }
+        in_flight = duplicate_repair.get("in_flight") or []
+        if in_flight:
+            return {
+                "action": "repair_in_progress",
+                "reason": "duplicate_public_ip",
+                "targets": in_flight,
+                "message": "duplicate public IP repair is already rotating one backend",
+            }
+        backoff = duplicate_repair.get("backoff_remaining") or {}
+        if backoff:
+            return {
+                "action": "wait_backoff",
+                "reason": "duplicate_public_ip",
+                "backoff_remaining": backoff,
+                "message": "duplicate public IP repair recently failed; waiting before retry",
+            }
+        return {
+            "action": "repair_requested",
+            "reason": "duplicate_public_ip",
+            "message": "fresh pool check requested duplicate public IP repair",
+        }
+    if "stale_state" in reasons:
+        return {
+            "action": "refresh_requested",
+            "reason": "stale_state",
+            "message": "fresh pool check requested a live state refresh",
+        }
+    if "too_few_healthy_backends" in reasons:
+        return {
+            "action": "manual",
+            "reason": "too_few_healthy_backends",
+            "message": "too few healthy backends; inspect unhealthy containers before rotating",
+        }
+    if "recovery_timeout" in reasons or "proxy_failure" in reasons:
+        return {
+            "action": "monitor",
+            "reason": "recent_recovery_failure",
+            "message": "recent recovery/proxy failure is degraded state; duplicate repair handles only duplicate IPs automatically",
+        }
+    return {
+        "action": "manual",
+        "reason": "degraded_pool",
+        "message": "pool is degraded; no automatic repair action is available for these reasons",
+    }
+
+
+def render_doctor_report(report: dict) -> str:
+    lines = [
+        f"Doctor result: {'PASS' if report.get('ok') else 'FAIL'}",
+        f"Pool status: {report.get('pool_status')} ({report.get('healthy_backends')}/{report.get('backend_count')} healthy)",
+        f"Repair decision: {(report.get('repair_decision') or {}).get('action')} - {(report.get('repair_decision') or {}).get('message')}",
+        "",
+        f"{'CHECK':<24} {'OK':<5} DETAIL",
+    ]
+    for name, check in report.get("checks", {}).items():
+        detail = check.get("error") or ""
+        if name == "pool_fresh":
+            reasons = ",".join(check.get("degraded_reasons") or []) or "-"
+            detail = (
+                f"status={check.get('pool_status')} fresh={check.get('state_fresh')} "
+                f"healthy={check.get('healthy_backends')}/{check.get('backend_count')} reasons={reasons}"
+            )
+        elif name == "env_local":
+            detail = (
+                f".env.local={check.get('ok')} configured={check.get('configured_env_file') or '-'} "
+                f"configured_exists={check.get('configured_env_file_exists')}"
+            )
+        elif name == "image_freshness":
+            detail = "up pulls images by default; use --no-pull to skip"
+        elif name == "haproxy_stats_port":
+            detail = detail or f"{check.get('bind')}:{check.get('port')} reachable"
+        lines.append(f"{name:<24} {str(bool(check.get('ok'))):<5} {detail}")
+    return "\n".join(lines)
+
+
 def cmd_up(cfg, pull_images: bool = True):
     generate(cfg)
     if pull_images:
@@ -641,17 +862,20 @@ def cmd_up(cfg, pull_images: bool = True):
 
 def cmd_status(cfg):
     data = api_call(cfg, "GET", "/pool")
-    print(f"{'INSTANCE':<28} {'STATUS':<20} {'HEALTHY':<8} {'ROT':<5} {'OUTCOME':<22} {'COOLDOWN':<16} PUBLIC IP")
+    print(f"{'INSTANCE':<28} {'STATUS':<20} {'FRESH':<6} {'HEALTHY':<8} {'ROT':<5} {'OUTCOME':<22} {'COOLDOWN':<16} PUBLIC IP")
     for it in data.get("instances", []):
         status = it.get("status") or ("healthy" if it.get("healthy") else "down")
         cooldown = float(it.get("cooldown_remaining_seconds") or 0)
         cooldown_text = f"{cooldown:.0f}s" if cooldown > 0 else "-"
         print(
-            f"{it['name']:<28} {status:<20} {str(it['healthy']):<8} "
+            f"{it['name']:<28} {status:<20} {str(bool(it.get('state_fresh'))):<6} {str(it['healthy']):<8} "
             f"{it['rotations']:<5} {it.get('last_rotation_outcome') or '-':<22} "
             f"{cooldown_text:<16} {it.get('public_ip') or '-'}"
         )
-    print(f"\nhealthy {data.get('healthy')}/{data.get('count')}  rotations {data.get('rotations_total')}")
+    print(
+        f"\npool {data.get('pool_status', '-')} fresh {data.get('state_fresh', False)} "
+        f"healthy {data.get('healthy')}/{data.get('count')}  rotations {data.get('rotations_total')}"
+    )
 
 
 def cmd_rotate(cfg, target):
@@ -701,15 +925,25 @@ def cmd_stress(
         raise SystemExit(1)
 
 
+def cmd_doctor(cfg: dict, json_output: bool = False):
+    result = doctor_report(cfg)
+    if json_output:
+        print(json.dumps(result, indent=2))
+    else:
+        print(render_doctor_report(result))
+    if not result.get("ok"):
+        raise SystemExit(1)
+
+
 def build_parser():
     p = argparse.ArgumentParser(description="chamosel - spin the wheel, change the skin")
-    p.add_argument("action", choices=["genkey", "generate", "up", "down", "status", "rotate", "verify-leaks", "stress"])
+    p.add_argument("action", choices=["genkey", "generate", "up", "down", "status", "rotate", "verify-leaks", "stress", "doctor"])
     p.add_argument("rotate_target", nargs="?", help="for rotate: instance name or 'all'")
     p.add_argument("-c", "--config", default=CONFIG_FILE)
     p.add_argument("--no-pull", action="store_true",
                    help="for up: skip docker compose pull and use local images")
     p.add_argument("--json", dest="json_output", action="store_true",
-                   help="for verify-leaks: output one JSON object")
+                   help="for verify-leaks/stress/doctor: output one JSON object")
     p.add_argument("--timeout", type=int, default=DEFAULT_LEAK_TIMEOUT,
                    help=f"for verify-leaks: request timeout in seconds (default: {DEFAULT_LEAK_TIMEOUT})")
     p.add_argument("--target", dest="leak_target", default=DEFAULT_LEAK_TARGET,
@@ -748,6 +982,7 @@ def main():
             json_output=a.json_output,
             verify_after_rotation=not a.no_verify,
         )
+    elif a.action == "doctor": cmd_doctor(cfg, a.json_output)
 
 
 if __name__ == "__main__":

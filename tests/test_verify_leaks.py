@@ -224,6 +224,7 @@ class VerifyLeakTests(unittest.TestCase):
 
         self.assertIn("verify-leaks", help_text)
         self.assertIn("stress", help_text)
+        self.assertIn("doctor", help_text)
         self.assertIn("--json", help_text)
         self.assertIn("--timeout", help_text)
         self.assertIn("--target", help_text)
@@ -260,6 +261,137 @@ class VerifyLeakTests(unittest.TestCase):
         self.assertIn("COOLDOWN", rendered)
         self.assertIn("recovery_timeout", rendered)
         self.assertIn("42s", rendered)
+
+    def test_doctor_json_does_not_expose_secrets(self):
+        Path(".env.local").write_text("WIREGUARD_PRIVATE_KEY=super-secret\n")
+        cfg = {
+            "global_settings": {
+                "api_port": 8800,
+                "stats_port": 8404,
+                "env_file": ".env.local",
+                "api_key": "config-secret",
+            },
+            "vpn_providers": {"surfshark": {"num_containers": 1}},
+        }
+        self.chamosel.compose_check = lambda args: {"ok": True, "returncode": 0, "stdout": "ok", "stderr": ""}
+        self.chamosel.tcp_check = lambda host, port, timeout=2: {"ok": True, "error": None}
+
+        def fake_api(cfg, method, path, timeout=15):
+            if path == "/health":
+                return {"ok": True, "status": 200, "payload": {"status": "ok"}, "error": None}
+            if path == "/pool?fresh=1":
+                return {
+                    "ok": True,
+                    "status": 200,
+                    "payload": {
+                        "healthy": 1,
+                        "count": 1,
+                        "pool_status": "healthy",
+                        "state_fresh": True,
+                        "degraded_reasons": [],
+                    },
+                    "error": None,
+                }
+            raise AssertionError(path)
+
+        self.chamosel.api_call_result = fake_api
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.chamosel.cmd_doctor(cfg, json_output=True)
+        rendered = buf.getvalue()
+        payload = json.loads(rendered)
+
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["checks"]["env_local"]["ok"])
+        self.assertEqual("none", payload["repair_decision"]["action"])
+        self.assertNotIn("super-secret", rendered)
+        self.assertNotIn("config-secret", rendered)
+        self.assertNotIn("WIREGUARD_PRIVATE_KEY", rendered)
+
+    def test_doctor_fails_when_pool_state_is_not_fresh(self):
+        self.chamosel.compose_check = lambda args: {"ok": True, "returncode": 0, "stdout": "ok", "stderr": ""}
+        self.chamosel.tcp_check = lambda host, port, timeout=2: {"ok": True, "error": None}
+
+        def fake_api(cfg, method, path, timeout=15):
+            if path == "/health":
+                return {"ok": True, "status": 200, "payload": {"status": "ok"}, "error": None}
+            if path == "/pool?fresh=1":
+                return {
+                    "ok": True,
+                    "status": 200,
+                    "payload": {
+                        "healthy": 1,
+                        "count": 1,
+                        "pool_status": "healthy",
+                        "state_fresh": False,
+                        "degraded_reasons": ["stale_state"],
+                    },
+                    "error": None,
+                }
+            raise AssertionError(path)
+
+        self.chamosel.api_call_result = fake_api
+
+        report = self.chamosel.doctor_report(self.cfg)
+
+        self.assertFalse(report["ok"])
+        self.assertFalse(report["checks"]["pool_fresh"]["ok"])
+
+    def test_doctor_reports_duplicate_ip_repair_in_progress(self):
+        self.chamosel.compose_check = lambda args: {"ok": True, "returncode": 0, "stdout": "ok", "stderr": ""}
+        self.chamosel.tcp_check = lambda host, port, timeout=2: {"ok": True, "error": None}
+
+        def fake_api(cfg, method, path, timeout=15):
+            if path == "/health":
+                return {"ok": True, "status": 200, "payload": {"status": "ok"}, "error": None}
+            if path == "/pool?fresh=1":
+                return {
+                    "ok": True,
+                    "status": 200,
+                    "payload": {
+                        "healthy": 2,
+                        "count": 2,
+                        "pool_status": "degraded",
+                        "state_fresh": True,
+                        "degraded_reasons": ["duplicate_public_ip"],
+                        "duplicate_repair": {
+                            "enabled": True,
+                            "in_flight": ["surfshark_4"],
+                            "backoff_remaining": {},
+                            "scheduled_total": 1,
+                        },
+                    },
+                    "error": None,
+                }
+            raise AssertionError(path)
+
+        self.chamosel.api_call_result = fake_api
+
+        report = self.chamosel.doctor_report(self.cfg)
+        rendered = self.chamosel.render_doctor_report(report)
+
+        self.assertFalse(report["ok"])
+        self.assertEqual("repair_in_progress", report["repair_decision"]["action"])
+        self.assertEqual(["surfshark_4"], report["repair_decision"]["targets"])
+        self.assertIn("Repair decision: repair_in_progress", rendered)
+
+    def test_doctor_reports_duplicate_ip_repair_backoff(self):
+        decision = self.chamosel.doctor_repair_decision(
+            True,
+            {
+                "pool_status": "degraded",
+                "degraded_reasons": ["duplicate_public_ip"],
+                "duplicate_repair": {
+                    "enabled": True,
+                    "in_flight": [],
+                    "backoff_remaining": {"surfshark_4": 120.0},
+                },
+            },
+        )
+
+        self.assertEqual("wait_backoff", decision["action"])
+        self.assertEqual({"surfshark_4": 120.0}, decision["backoff_remaining"])
 
     def test_stress_parser_accepts_expected_options(self):
         args = self.chamosel.build_parser().parse_args(

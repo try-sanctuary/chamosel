@@ -9,17 +9,20 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def load_controller(tmpdir, instances="vpn_0,vpn_1"):
+def load_controller(tmpdir, instances="vpn_0,vpn_1", env_overrides=None):
     old_env = os.environ.copy()
-    os.environ.update(
-        {
-            "INSTANCES": instances,
-            "STATE_FILE": str(Path(tmpdir) / "state.json"),
-            "GLUETUN_API_KEY": "secret",
-            "POLL_WORKERS": "8",
-            "ROTATION_RECOVERY_TIMEOUT": "1",
-        }
-    )
+    env = {
+        "INSTANCES": instances,
+        "STATE_FILE": str(Path(tmpdir) / "state.json"),
+        "GLUETUN_API_KEY": "secret",
+        "POLL_WORKERS": "8",
+        "ROTATION_RECOVERY_TIMEOUT": "1",
+        "ROTATE_ALL_BATCH_SIZE": "2",
+        "ROTATE_ALL_BATCH_DELAY_SECONDS": "0",
+    }
+    if env_overrides:
+        env.update(env_overrides)
+    os.environ.update(env)
     spec = importlib.util.spec_from_file_location(
         f"controller_under_test_{time.time_ns()}",
         ROOT / "controller" / "controller.py",
@@ -232,6 +235,8 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(0.0, state["cooldown_remaining_seconds"])
         self.assertIsNone(state["cooldown_reason"])
         self.assertEqual(0, state["forced_bypass_count"])
+        self.assertFalse(state["state_fresh"])
+        self.assertFalse(snap["state_fresh"])
 
         self.ctrl.STATE.start_cooldown("vpn_0", self.ctrl.OUTCOME_RECOVERY_TIMEOUT)
         self.ctrl.STATE.record_rotation(
@@ -249,6 +254,114 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual("1.1.1.1", persisted["last_rotation_old_ip"])
         self.assertGreater(persisted["cooldown_until"], time.time())
         self.assertEqual(self.ctrl.OUTCOME_RECOVERY_TIMEOUT, persisted["cooldown_reason"])
+        self.assertFalse(persisted["state_fresh"])
+
+    def test_loaded_state_is_stale_until_refreshed(self):
+        self.ctrl.STATE.update_health("vpn_0", True, "1.1.1.1", status=self.ctrl.STATUS_HEALTHY)
+        self.ctrl.STATE.update_health("vpn_1", True, "2.2.2.2", status=self.ctrl.STATUS_HEALTHY)
+
+        reloaded = self.ctrl.State()
+        stale = reloaded.snapshot()
+        self.assertFalse(stale["state_fresh"])
+        self.assertIn(self.ctrl.DEGRADED_STALE_STATE, stale["degraded_reasons"])
+
+        reloaded.update_health("vpn_0", True, "1.1.1.1", status=self.ctrl.STATUS_HEALTHY)
+        reloaded.update_health("vpn_1", True, "2.2.2.2", status=self.ctrl.STATUS_HEALTHY)
+        fresh = reloaded.snapshot()
+        self.assertTrue(fresh["state_fresh"])
+        self.assertNotIn(self.ctrl.DEGRADED_STALE_STATE, fresh["degraded_reasons"])
+
+    def test_expired_failure_cooldown_is_not_active_after_restart(self):
+        self.ctrl.STATE.start_cooldown("vpn_0", self.ctrl.OUTCOME_RECOVERY_TIMEOUT, duration=0)
+        self.ctrl.STATE.record_rotation("vpn_0", self.ctrl.OUTCOME_RECOVERY_TIMEOUT)
+
+        reloaded = self.ctrl.State()
+        state = reloaded.snapshot()["instances"][0]
+
+        self.assertEqual(0.0, state["cooldown_remaining_seconds"])
+        self.assertIsNone(state["cooldown_reason"])
+        self.assertEqual(0.0, state["cooldown_until"])
+
+    def test_duplicate_public_ip_marks_pool_degraded(self):
+        self.ctrl.STATE.update_health("vpn_0", True, "1.1.1.1", status=self.ctrl.STATUS_HEALTHY)
+        self.ctrl.STATE.update_health("vpn_1", True, "1.1.1.1", status=self.ctrl.STATUS_HEALTHY)
+
+        snap = self.ctrl.STATE.snapshot()
+
+        self.assertEqual(self.ctrl.POOL_STATUS_DEGRADED, snap["pool_status"])
+        self.assertIn(self.ctrl.DEGRADED_DUPLICATE_PUBLIC_IP, snap["degraded_reasons"])
+
+    def test_duplicate_public_ip_refresh_schedules_one_repair_rotation(self):
+        calls = []
+
+        class ImmediateThread:
+            def __init__(self, target, args=(), daemon=None):
+                self.target = target
+                self.args = args
+
+            def start(self):
+                self.target(*self.args)
+
+        original_thread = self.ctrl.threading.Thread
+        try:
+            self.ctrl.threading.Thread = ImmediateThread
+            self.ctrl.rotate_instance = lambda instance, force=False: calls.append((instance, force)) or {
+                "instance": instance,
+                "ok": True,
+                "outcome": self.ctrl.OUTCOME_SUCCESS,
+            }
+            self.ctrl.STATE.update_health("vpn_0", True, "1.1.1.1", status=self.ctrl.STATUS_HEALTHY)
+            self.ctrl.STATE.update_health("vpn_1", True, "1.1.1.1", status=self.ctrl.STATUS_HEALTHY)
+
+            self.ctrl.maybe_schedule_duplicate_ip_repair()
+        finally:
+            self.ctrl.threading.Thread = original_thread
+
+        self.assertEqual([("vpn_1", False)], calls)
+        self.assertEqual(1, self.ctrl.duplicate_repair_snapshot()["scheduled_total"])
+
+    def test_duplicate_public_ip_repair_respects_cooldown(self):
+        self.ctrl.STATE.update_health("vpn_0", True, "1.1.1.1", status=self.ctrl.STATUS_HEALTHY)
+        self.ctrl.STATE.update_health("vpn_1", True, "1.1.1.1", status=self.ctrl.STATUS_HEALTHY)
+        self.ctrl.STATE.start_cooldown("vpn_1", self.ctrl.OUTCOME_RECOVERY_TIMEOUT)
+
+        self.ctrl.maybe_schedule_duplicate_ip_repair()
+
+        self.assertEqual([], self.ctrl.duplicate_repair_snapshot()["in_flight"])
+        self.assertEqual(0, self.ctrl.duplicate_repair_snapshot()["scheduled_total"])
+
+    def test_failed_duplicate_public_ip_repair_sets_retry_backoff(self):
+        calls = []
+
+        class ImmediateThread:
+            def __init__(self, target, args=(), daemon=None):
+                self.target = target
+                self.args = args
+
+            def start(self):
+                self.target(*self.args)
+
+        original_thread = self.ctrl.threading.Thread
+        try:
+            self.ctrl.threading.Thread = ImmediateThread
+            self.ctrl.DUPLICATE_REPAIR_RETRY_COOLDOWN = 300
+            self.ctrl.rotate_instance = lambda instance, force=False: calls.append((instance, force)) or {
+                "instance": instance,
+                "ok": False,
+                "outcome": self.ctrl.OUTCOME_RECOVERY_TIMEOUT,
+            }
+            self.ctrl.STATE.update_health("vpn_0", True, "1.1.1.1", status=self.ctrl.STATUS_HEALTHY)
+            self.ctrl.STATE.update_health("vpn_1", True, "1.1.1.1", status=self.ctrl.STATUS_HEALTHY)
+
+            self.ctrl.maybe_schedule_duplicate_ip_repair()
+            self.ctrl.maybe_schedule_duplicate_ip_repair()
+        finally:
+            self.ctrl.threading.Thread = original_thread
+
+        self.assertEqual([("vpn_1", False)], calls)
+        repair = self.ctrl.duplicate_repair_snapshot()
+        self.assertEqual(1, repair["scheduled_total"])
+        self.assertGreater(repair["backoff_remaining"]["vpn_1"], 0)
 
     def test_recovery_timeout_starts_cooldown(self):
         def fake_ctrl(method, instance, path, body=None):
@@ -294,10 +407,34 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(self.ctrl.AGG_OUTCOME_PARTIAL_SUCCESS, result["outcome"])
         self.assertEqual(1, result["eligible_count"])
         self.assertEqual(1, result["skipped_count"])
+        self.assertEqual(1, result["batch_count"])
+        self.assertEqual(0, result["timed_out_count"])
         self.assertEqual(1, result["success_count"])
         self.assertEqual(1, result["cooldown_count"])
         self.assertEqual([("vpn_1", False)], calls)
         self.assertEqual(self.ctrl.OUTCOME_COOLDOWN, result["results"][0]["outcome"])
+
+    def test_rotate_all_batches_eligible_backends_and_counts_timeouts(self):
+        ctrl = load_controller(self.tmp.name, instances="vpn_0,vpn_1,vpn_2,vpn_3,vpn_4")
+        ctrl.ROTATE_ALL_BATCH_SIZE = 2
+        ctrl.ROTATE_ALL_BATCH_DELAY_SECONDS = 0
+        calls = []
+
+        def fake_rotate(instance, force=False):
+            calls.append(instance)
+            outcome = ctrl.OUTCOME_RECOVERY_TIMEOUT if instance == "vpn_3" else ctrl.OUTCOME_SUCCESS
+            return ctrl.rotation_response(instance, outcome == ctrl.OUTCOME_SUCCESS, outcome, time.monotonic())
+
+        ctrl.STATE.start_cooldown("vpn_0", ctrl.OUTCOME_RECOVERY_TIMEOUT)
+        ctrl.rotate_instance = fake_rotate
+
+        result = ctrl.rotate_all()
+
+        self.assertEqual(4, result["eligible_count"])
+        self.assertEqual(1, result["skipped_count"])
+        self.assertEqual(2, result["batch_count"])
+        self.assertEqual(1, result["timed_out_count"])
+        self.assertEqual({"vpn_1", "vpn_2", "vpn_3", "vpn_4"}, set(calls))
 
     def test_named_force_bypasses_cooldown_and_reports_bypass(self):
         def fake_ctrl(method, instance, path, body=None):
@@ -373,6 +510,18 @@ class ControllerTests(unittest.TestCase):
         self.assertIn('chamosel_instance_rotation_outcome{instance="vpn_0",outcome="recovery_timeout"} 1', metrics)
         self.assertIn('chamosel_instance_rotation_cooldown_active{instance="vpn_0"} 1', metrics)
         self.assertIn('chamosel_instance_rotation_cooldown_remaining_seconds{instance="vpn_0"}', metrics)
+
+    def test_metrics_expose_pool_status_and_state_freshness(self):
+        self.ctrl.STATE.update_health("vpn_0", True, "1.1.1.1", status=self.ctrl.STATUS_HEALTHY)
+        self.ctrl.STATE.update_health("vpn_1", True, "1.1.1.1", status=self.ctrl.STATUS_HEALTHY)
+
+        metrics = self.ctrl.render_metrics()
+
+        self.assertIn('chamosel_pool_status{status="degraded"} 1', metrics)
+        self.assertIn('chamosel_pool_degraded_reason{reason="duplicate_public_ip"} 1', metrics)
+        self.assertIn("chamosel_state_fresh 1", metrics)
+        self.assertIn("chamosel_duplicate_ip_repair_scheduled_total", metrics)
+        self.assertIn("chamosel_duplicate_ip_repair_in_flight", metrics)
 
     def test_dashboard_exposes_latest_outcome_and_cooldown(self):
         self.ctrl.STATE.start_cooldown("vpn_0", self.ctrl.OUTCOME_RECOVERY_TIMEOUT)
