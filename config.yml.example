@@ -20,6 +20,8 @@ global_settings:
   egress_verify_timeout: 10 # per-backend verified proxy IP timeout
   egress_verify_ttl: 120    # seconds to trust cached verified proxy IP
   egress_verify_on_fresh: true # /pool?fresh=1 refreshes verified proxy IP when expired
+  controller_auth_enabled: false # protect controller API/dashboard/metrics/repair with X-Chamosel-Auth
+  # controller_auth_token: "" # optional; generated into .env when controller_auth_enabled is true
   poll_interval: 15         # background health/IP poll interval
   # api_key: ""             # optional; auto-generated into .env if omitted
 

@@ -74,6 +74,8 @@ DEFAULTS = {
     "egress_verify_timeout": 10,
     "egress_verify_ttl": 120,
     "egress_verify_on_fresh": True,
+    "controller_auth_enabled": False,
+    "controller_auth_token": "",
     "poll_interval": 15,
 }
 
@@ -112,6 +114,15 @@ def gset(cfg: dict, key: str):
     return cfg.get("global_settings", {}).get(key, DEFAULTS[key])
 
 
+def truthy(value) -> bool:
+    return str(value).strip().lower() not in ("", "0", "false", "no", "off", "none")
+
+
+def is_loopback_bind(value: str) -> bool:
+    value = str(value or "").strip().lower()
+    return value in ("127.0.0.1", "localhost", "::1")
+
+
 def iter_instances(cfg: dict):
     for pkey, prov in cfg["vpn_providers"].items():
         for i in range(int(prov.get("num_containers", 1))):
@@ -132,34 +143,44 @@ class ApiKeyResolution:
     source: str
 
 
-def read_env_api_key(path: str = ENV_FILE) -> str:
+def read_env_value(name: str, path: str = ENV_FILE) -> str:
+    prefix = f"{name}="
     try:
         with open(path) as fh:
             for line in fh:
-                if line.startswith("GLUETUN_API_KEY="):
+                if line.startswith(prefix):
                     return line.split("=", 1)[1].strip()
     except FileNotFoundError:
         return ""
     return ""
 
 
-def write_env_api_key(key: str, path: str = ENV_FILE):
+def write_env_value(name: str, value: str, path: str = ENV_FILE):
+    prefix = f"{name}="
     lines = []
     found = False
     try:
         with open(path) as fh:
             for line in fh:
-                if line.startswith("GLUETUN_API_KEY="):
-                    lines.append(f"GLUETUN_API_KEY={key}\n")
+                if line.startswith(prefix):
+                    lines.append(f"{name}={value}\n")
                     found = True
                 else:
                     lines.append(line)
     except FileNotFoundError:
         pass
     if not found:
-        lines.append(f"GLUETUN_API_KEY={key}\n")
+        lines.append(f"{name}={value}\n")
     with open(path, "w") as fh:
         fh.writelines(lines)
+
+
+def read_env_api_key(path: str = ENV_FILE) -> str:
+    return read_env_value("GLUETUN_API_KEY", path)
+
+
+def write_env_api_key(key: str, path: str = ENV_FILE):
+    write_env_value("GLUETUN_API_KEY", key, path)
 
 
 def resolve_api_key_info(cfg: dict, env_path: str = ENV_FILE) -> ApiKeyResolution:
@@ -195,16 +216,82 @@ def resolve_api_key(cfg: dict) -> str:
     return resolve_api_key_info(cfg).key
 
 
+def controller_auth_enabled(cfg: dict) -> bool:
+    return truthy(gset(cfg, "controller_auth_enabled"))
+
+
+def read_controller_auth_token(cfg: dict, env_path: str = ENV_FILE) -> str:
+    env_token = os.environ.get("CONTROLLER_AUTH_TOKEN", "").strip()
+    if env_token:
+        return env_token
+    file_token = read_env_value("CONTROLLER_AUTH_TOKEN", env_path)
+    if file_token:
+        return file_token
+    return str(cfg.get("global_settings", {}).get("controller_auth_token") or "").strip()
+
+
+def resolve_controller_auth_info(cfg: dict, env_path: str = ENV_FILE) -> ApiKeyResolution:
+    """Resolve and persist the controller API token when controller auth is enabled."""
+    if not controller_auth_enabled(cfg):
+        return ApiKeyResolution("", "disabled")
+
+    env_token = os.environ.get("CONTROLLER_AUTH_TOKEN", "").strip()
+    file_token = read_env_value("CONTROLLER_AUTH_TOKEN", env_path)
+    cfg_token = str(cfg.get("global_settings", {}).get("controller_auth_token") or "").strip()
+
+    if file_token and cfg_token and file_token != cfg_token:
+        log.error(
+            "Conflicting CONTROLLER_AUTH_TOKEN values in %s and global_settings.controller_auth_token; "
+            "remove one or make them identical.",
+            env_path,
+        )
+        sys.exit(1)
+    if env_token:
+        return ApiKeyResolution(env_token, "environment")
+    if file_token:
+        return ApiKeyResolution(file_token, env_path)
+    if cfg_token:
+        write_env_value("CONTROLLER_AUTH_TOKEN", cfg_token, env_path)
+        return ApiKeyResolution(cfg_token, "config")
+
+    token = gen_api_key()
+    write_env_value("CONTROLLER_AUTH_TOKEN", token, env_path)
+    log.info("Generated controller auth token, saved to %s", env_path)
+    return ApiKeyResolution(token, "generated")
+
+
+def controller_auth_headers(cfg: dict) -> dict:
+    if not controller_auth_enabled(cfg):
+        return {}
+    token = read_controller_auth_token(cfg)
+    return {"X-Chamosel-Auth": token} if token else {}
+
+
+def validate_controller_exposure(cfg: dict):
+    if is_loopback_bind(gset(cfg, "api_bind")) or controller_auth_enabled(cfg):
+        return
+    log.error(
+        "Refusing to publish the controller API on %s without controller_auth_enabled=true. "
+        "Use api_bind: 127.0.0.1 for local-only access or enable controller auth.",
+        gset(cfg, "api_bind"),
+    )
+    sys.exit(1)
+
+
 def write_text(path: str, content: str):
     with open(path, "w") as fh:
         fh.write(content)
 
 
 def generate(cfg: dict):
+    validate_controller_exposure(cfg)
     api_key_info = resolve_api_key_info(cfg)
+    controller_auth_info = resolve_controller_auth_info(cfg)
     api_key = api_key_info.key
     if api_key_info.source == "config":
         log.info("Persisted global_settings.api_key to %s for controller interpolation", ENV_FILE)
+    if controller_auth_info.source == "config":
+        log.info("Persisted global_settings.controller_auth_token to %s for controller interpolation", ENV_FILE)
     # gluetun v3.41+ default-role apikey auth via env (no config.toml mount needed)
     auth_role = json.dumps({"auth": "apikey", "apikey": api_key}, separators=(",", ":"))
     instances = list(iter_instances(cfg))
@@ -233,6 +320,7 @@ def generate(cfg: dict):
         egress_verify_timeout=gset(cfg, "egress_verify_timeout"),
         egress_verify_ttl=gset(cfg, "egress_verify_ttl"),
         egress_verify_on_fresh=str(gset(cfg, "egress_verify_on_fresh")).lower(),
+        controller_auth_enabled=str(controller_auth_enabled(cfg)).lower(),
         poll_interval=gset(cfg, "poll_interval"),
         auth_default_role=auth_role,
         gluetun_health_port=GLUETUN_HEALTH_PORT,
@@ -296,7 +384,7 @@ def api_timeout_for_rotation(cfg: dict) -> int:
 
 def api_call(cfg: dict, method: str, path: str, timeout: int = 15):
     url = f"http://localhost:{gset(cfg, 'api_port')}{path}"
-    req = urllib.request.Request(url, method=method)
+    req = urllib.request.Request(url, method=method, headers=controller_auth_headers(cfg))
     try:
         return json.load(urllib.request.urlopen(req, timeout=timeout))
     except Exception as e:
@@ -305,7 +393,7 @@ def api_call(cfg: dict, method: str, path: str, timeout: int = 15):
 
 def api_call_result(cfg: dict, method: str, path: str, timeout: int = 15) -> dict:
     url = f"http://localhost:{gset(cfg, 'api_port')}{path}"
-    req = urllib.request.Request(url, method=method)
+    req = urllib.request.Request(url, method=method, headers=controller_auth_headers(cfg))
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return {"ok": True, "status": resp.status, "payload": json.load(resp), "error": None}
@@ -375,7 +463,7 @@ def fetch_direct_ip(target: str, timeout: int) -> tuple[str, dict]:
 
 def fetch_pool_state(cfg: dict) -> dict:
     url = f"http://localhost:{gset(cfg, 'api_port')}/pool?fresh=1"
-    req = urllib.request.Request(url, method="GET")
+    req = urllib.request.Request(url, method="GET", headers=controller_auth_headers(cfg))
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.load(resp)
@@ -697,11 +785,13 @@ def run_stress(
     return report
 
 
-def doctor_report(cfg: dict) -> dict:
+def doctor_report(cfg: dict, repair: bool = False) -> dict:
     configured_instances = sum(1 for _ in iter_instances(cfg))
     env_file = str(gset(cfg, "env_file") or "").strip()
     env_local_exists = os.path.exists(".env.local")
     configured_env_file_exists = bool(env_file) and os.path.exists(env_file)
+    auth_enabled = controller_auth_enabled(cfg)
+    auth_token_configured = bool(read_controller_auth_token(cfg))
 
     compose = compose_check(["ps"])
     health = api_call_result(cfg, "GET", "/health", timeout=5)
@@ -714,6 +804,27 @@ def doctor_report(cfg: dict) -> dict:
     pool_status = pool_payload.get("pool_status") or ("healthy" if healthy_count == backend_count and backend_count else "down")
     pool_fresh_ok = pool["ok"] and pool_status == "healthy" and bool(pool_payload.get("state_fresh"))
     repair_decision = doctor_repair_decision(pool["ok"], pool_payload)
+    repair_result = None
+    if repair:
+        if repair_decision.get("action") == "repair_requested":
+            repair_result = api_call_result(
+                cfg,
+                "POST",
+                "/repair/duplicate-ip",
+                timeout=max(15, int(gset(cfg, "rotation_recovery_timeout")) + 15),
+            )
+        else:
+            repair_result = {
+                "ok": True,
+                "status": None,
+                "payload": {
+                    "attempted": False,
+                    "outcome": "skipped",
+                    "reason": repair_decision.get("reason"),
+                    "message": "doctor repair skipped because no safe repair action was requested",
+                },
+                "error": None,
+            }
     checks = {
         "compose_stack": {
             "ok": compose["ok"],
@@ -750,6 +861,12 @@ def doctor_report(cfg: dict) -> dict:
             "up_pulls_images_by_default": True,
             "skip_flag": "--no-pull",
         },
+        "controller_auth": {
+            "ok": (not auth_enabled) or auth_token_configured,
+            "enabled": auth_enabled,
+            "token_configured": auth_token_configured,
+            "error": None if (not auth_enabled or auth_token_configured) else "controller auth is enabled but no token is configured",
+        },
     }
     ok = (
         checks["compose_stack"]["ok"]
@@ -757,6 +874,7 @@ def doctor_report(cfg: dict) -> dict:
         and checks["pool_fresh"]["ok"]
         and healthy_count > 0
         and checks["haproxy_stats_port"]["ok"]
+        and checks["controller_auth"]["ok"]
     )
     return {
         "ok": ok,
@@ -765,6 +883,7 @@ def doctor_report(cfg: dict) -> dict:
         "healthy_backends": healthy_count,
         "backend_count": backend_count,
         "repair_decision": repair_decision,
+        "repair_result": repair_result,
         "checks": checks,
     }
 
@@ -881,9 +1000,19 @@ def render_doctor_report(report: dict) -> str:
             )
         elif name == "image_freshness":
             detail = "up pulls images by default; use --no-pull to skip"
+        elif name == "controller_auth":
+            detail = detail or f"enabled={check.get('enabled')} token_configured={check.get('token_configured')}"
         elif name == "haproxy_stats_port":
             detail = detail or f"{check.get('bind')}:{check.get('port')} reachable"
         lines.append(f"{name:<24} {str(bool(check.get('ok'))):<5} {detail}")
+    repair_result = report.get("repair_result")
+    if repair_result:
+        payload = repair_result.get("payload") or {}
+        lines.append("")
+        lines.append(
+            f"Repair result: {payload.get('outcome') or '-'} "
+            f"attempted={payload.get('attempted')} ok={repair_result.get('ok')}"
+        )
     return "\n".join(lines)
 
 
@@ -968,8 +1097,8 @@ def cmd_stress(
         raise SystemExit(1)
 
 
-def cmd_doctor(cfg: dict, json_output: bool = False):
-    result = doctor_report(cfg)
+def cmd_doctor(cfg: dict, json_output: bool = False, repair: bool = False):
+    result = doctor_report(cfg, repair=repair)
     if json_output:
         print(json.dumps(result, indent=2))
     else:
@@ -999,6 +1128,8 @@ def build_parser():
                    help="for stress: write summary.json to this directory")
     p.add_argument("--no-verify", action="store_true",
                    help="for stress --mode rotation: skip verify-leaks after each rotation")
+    p.add_argument("--repair", action="store_true",
+                   help="for doctor: after diagnosis, request one safe duplicate-IP repair action")
     return p
 
 
@@ -1025,7 +1156,7 @@ def main():
             json_output=a.json_output,
             verify_after_rotation=not a.no_verify,
         )
-    elif a.action == "doctor": cmd_doctor(cfg, a.json_output)
+    elif a.action == "doctor": cmd_doctor(cfg, a.json_output, repair=a.repair)
 
 
 if __name__ == "__main__":

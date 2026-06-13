@@ -51,6 +51,7 @@ Endpoints:
   POST /rotate/all               rotate every eligible instance in bounded batches
 """
 
+import hmac
 import json
 import os
 import ipaddress
@@ -83,6 +84,9 @@ EGRESS_VERIFY_TARGET = os.environ.get("EGRESS_VERIFY_TARGET", "https://ifconfig.
 EGRESS_VERIFY_TIMEOUT = max(1, int(os.environ.get("EGRESS_VERIFY_TIMEOUT", "10")))
 EGRESS_VERIFY_TTL = max(0, int(os.environ.get("EGRESS_VERIFY_TTL", "120")))
 EGRESS_VERIFY_ON_FRESH = os.environ.get("EGRESS_VERIFY_ON_FRESH", "true").strip().lower() not in ("0", "false", "no", "off")
+CONTROLLER_AUTH_ENABLED = os.environ.get("CONTROLLER_AUTH_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
+CONTROLLER_AUTH_TOKEN = os.environ.get("CONTROLLER_AUTH_TOKEN", "").strip()
+CONTROLLER_AUTH_HEADER = "X-Chamosel-Auth"
 POLL_WORKERS = int(os.environ.get("POLL_WORKERS", str(max(1, min(16, len(INSTANCES) or 1)))))
 
 STATUS_HEALTHY = "healthy"
@@ -137,6 +141,19 @@ def log(msg: str):
 
 def sleep(seconds: float):
     time.sleep(seconds)
+
+
+def controller_auth_required() -> bool:
+    return CONTROLLER_AUTH_ENABLED
+
+
+def controller_auth_valid(headers) -> bool:
+    if not controller_auth_required():
+        return True
+    if not CONTROLLER_AUTH_TOKEN:
+        return False
+    supplied = headers.get(CONTROLLER_AUTH_HEADER, "")
+    return hmac.compare_digest(str(supplied), CONTROLLER_AUTH_TOKEN)
 
 
 # --------------------------------------------------------------------------- #
@@ -715,6 +732,87 @@ def duplicate_repair_worker(instance: str, duplicate_ip: str):
             DUPLICATE_REPAIR_IN_FLIGHT.discard(instance)
 
 
+def repair_duplicate_ip_once() -> dict:
+    global DUPLICATE_REPAIR_SCHEDULED_TOTAL
+    if not AUTO_REPAIR_DUPLICATE_IPS:
+        return {
+            "ok": False,
+            "attempted": False,
+            "outcome": "blocked",
+            "reason": "duplicate_repair_disabled",
+            "message": "duplicate egress IP repair is disabled",
+            "duplicate_repair": duplicate_repair_snapshot(),
+        }
+
+    snap = STATE.snapshot()
+    reasons = snap.get("degraded_reasons") or []
+    duplicate_reason = None
+    if DEGRADED_VERIFIED_DUPLICATE_PROXY_IP in reasons:
+        duplicate_reason = DEGRADED_VERIFIED_DUPLICATE_PROXY_IP
+    elif DEGRADED_DUPLICATE_PUBLIC_IP in reasons:
+        duplicate_reason = DEGRADED_DUPLICATE_PUBLIC_IP
+    if duplicate_reason is None:
+        return {
+            "ok": True,
+            "attempted": False,
+            "outcome": "none",
+            "reason": "no_duplicate_egress_ip",
+            "message": "no duplicate verified proxy IP or public IP is repairable",
+            "duplicate_repair": duplicate_repair_snapshot(),
+        }
+
+    instance, duplicate_ip = select_duplicate_repair_candidate(snap)
+    if not instance:
+        return {
+            "ok": False,
+            "attempted": False,
+            "outcome": "blocked",
+            "reason": duplicate_reason,
+            "message": "duplicate egress IP exists, but no backend is currently eligible for repair",
+            "duplicate_repair": duplicate_repair_snapshot(),
+        }
+
+    with DUPLICATE_REPAIR_LOCK:
+        if instance in DUPLICATE_REPAIR_IN_FLIGHT:
+            in_progress = True
+        else:
+            in_progress = False
+            DUPLICATE_REPAIR_IN_FLIGHT.add(instance)
+            DUPLICATE_REPAIR_SCHEDULED_TOTAL += 1
+    if in_progress:
+        return {
+            "ok": False,
+            "attempted": False,
+            "outcome": "repair_in_progress",
+            "reason": duplicate_reason,
+            "target": instance,
+            "duplicate_ip": duplicate_ip,
+            "duplicate_repair": duplicate_repair_snapshot(),
+        }
+
+    result = None
+    try:
+        result = rotate_instance(instance, force=False)
+        with DUPLICATE_REPAIR_LOCK:
+            if result.get("ok"):
+                DUPLICATE_REPAIR_BACKOFF_UNTIL.pop(instance, None)
+            elif DUPLICATE_REPAIR_RETRY_COOLDOWN > 0:
+                DUPLICATE_REPAIR_BACKOFF_UNTIL[instance] = time.time() + DUPLICATE_REPAIR_RETRY_COOLDOWN
+    finally:
+        with DUPLICATE_REPAIR_LOCK:
+            DUPLICATE_REPAIR_IN_FLIGHT.discard(instance)
+    return {
+        "ok": bool(result.get("ok")),
+        "attempted": True,
+        "outcome": "repair_attempted",
+        "reason": duplicate_reason,
+        "target": instance,
+        "duplicate_ip": duplicate_ip,
+        "rotation": result,
+        "duplicate_repair": duplicate_repair_snapshot(),
+    }
+
+
 def maybe_schedule_duplicate_ip_repair():
     global DUPLICATE_REPAIR_SCHEDULED_TOTAL
     if not AUTO_REPAIR_DUPLICATE_IPS:
@@ -1145,15 +1243,27 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         log(f"{self.address_string()} {fmt % args}")
 
+    def _require_auth(self) -> bool:
+        if controller_auth_valid(getattr(self, "headers", {})):
+            return True
+        self._json(401, {"error": "unauthorized"})
+        return False
+
     def do_GET(self):
         parsed = urlparse(self.path)
-        if parsed.path == "/":
-            self._raw(200, render_dashboard().encode(), "text/html; charset=utf-8")
-        elif parsed.path == "/health":
+        if parsed.path == "/health":
             self._json(200, {"status": "ok", "instances": len(INSTANCES)})
+        elif parsed.path == "/":
+            if not self._require_auth():
+                return
+            self._raw(200, render_dashboard().encode(), "text/html; charset=utf-8")
         elif parsed.path == "/metrics":
+            if not self._require_auth():
+                return
             self._raw(200, render_metrics().encode(), "text/plain; version=0.0.4")
         elif parsed.path == "/pool":
+            if not self._require_auth():
+                return
             if parse_qs(parsed.query).get("fresh"):
                 refresh_instances(verify_egress=EGRESS_VERIFY_ON_FRESH)
             self._json(200, STATE.snapshot())
@@ -1161,12 +1271,16 @@ class Handler(BaseHTTPRequestHandler):
             self._json(404, {"error": "not found"})
 
     def do_POST(self):
+        if not self._require_auth():
+            return
         if not INSTANCES:
             return self._json(503, {"error": "no instances configured"})
         if self.path == "/rotate":
             self._json(200, rotate_one_random())
         elif self.path == "/rotate/all":
             self._json(200, rotate_all())
+        elif self.path == "/repair/duplicate-ip":
+            self._json(200, repair_duplicate_ip_once())
         elif self.path.startswith("/rotate/"):
             self._json(200, rotate_instance(self.path[len("/rotate/"):], force=True))
         else:
@@ -1174,9 +1288,15 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    log(f"instances={INSTANCES} listen={LISTEN_PORT} auth={'on' if API_KEY else 'OFF'}")
+    log(
+        f"instances={INSTANCES} listen={LISTEN_PORT} "
+        f"gluetun_auth={'on' if API_KEY else 'OFF'} "
+        f"controller_auth={'on' if controller_auth_required() else 'OFF'}"
+    )
     if not API_KEY:
         log("WARNING: GLUETUN_API_KEY not set; gluetun v3.40+ requires auth and will 401")
+    if CONTROLLER_AUTH_ENABLED and not CONTROLLER_AUTH_TOKEN:
+        log("WARNING: CONTROLLER_AUTH_ENABLED=true but CONTROLLER_AUTH_TOKEN is empty; protected routes will reject all requests")
     threading.Thread(target=poll_loop, daemon=True).start()
     if AUTO_ROTATE > 0:
         threading.Thread(target=auto_rotate_loop, daemon=True).start()

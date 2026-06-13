@@ -55,6 +55,8 @@ services:
       INSTANCES: {{ names | join(',') | tojson }}
       GLUETUN_CONTROL_PORT: "{{ gluetun_control_port }}"
       GLUETUN_API_KEY: "${GLUETUN_API_KEY}"
+      CONTROLLER_AUTH_ENABLED: "{{ controller_auth_enabled }}"
+      CONTROLLER_AUTH_TOKEN: "${CONTROLLER_AUTH_TOKEN}"
       LISTEN_PORT: "{{ controller_port }}"
       AUTO_ROTATE_SECONDS: "{{ auto_rotate }}"
       ROTATE_COOLDOWN: "{{ rotate_cooldown }}"

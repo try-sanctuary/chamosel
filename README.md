@@ -52,6 +52,7 @@ curl -x http://localhost:8888 https://ipinfo.io/ip
 | `chamosel.py status` | Health + public IP + rotation count per instance |
 | `chamosel.py rotate [name\|all]` | Ask the controller to rotate |
 | `chamosel.py doctor` | Diagnose compose/controller/pool/stats/env/image freshness state |
+| `chamosel.py doctor --repair` | Diagnose, then request one safe duplicate-IP repair action |
 | `chamosel.py verify-leaks` | Verify backend proxy exit IPs do not expose the host IP |
 | `chamosel.py stress` | Repeat leak-only or rotation stress validation |
 
@@ -62,9 +63,12 @@ curl -x http://localhost:8888 https://ipinfo.io/ip
 ```bash
 python3 chamosel.py doctor
 python3 chamosel.py doctor --json
+python3 chamosel.py doctor --repair
 ```
 
 It checks Docker Compose visibility, controller `/health`, a fresh `/pool?fresh=1`, HAProxy stats port reachability, healthy backend count, image freshness mode, and whether `.env.local` exists. It reports paths and booleans only, not secret values. A fresh pool check also refreshes verified backend proxy exit IPs when their cache is expired. When the pool is degraded, `doctor` reports a `repair_decision`: duplicate verified proxy IPs can trigger controller repair, public-IP mismatch is monitored without rotation, and failed egress verification requires manual inspection.
+
+`doctor` is read-only unless `--repair` is passed. With `--repair`, it diagnoses first and then calls the controller repair endpoint only when the decision is `repair_requested`. That repair is bounded to one non-forced duplicate-IP backend rotation. `public_ip_mismatch` remains monitor-only when verified proxy IPs are unique.
 
 ## Leak Verification
 
@@ -185,6 +189,8 @@ global_settings:
   egress_verify_timeout: 10
   egress_verify_ttl: 120
   egress_verify_on_fresh: true
+  controller_auth_enabled: false
+  # controller_auth_token: "" # optional; generated into .env when controller auth is enabled
   poll_interval: 15          # background health/IP poll interval
   # api_key: ""              # optional local gluetun control-server key
 
@@ -214,13 +220,15 @@ $res = $client->fetchWithRetry('https://example.com/products');
 - **Per-request IP rotation:** with `mode tcp`, one keep-alive connection pins one exit IP. Set `CURLOPT_FRESH_CONNECT` in PHP (already done in the example) or use `balance leastconn`.
 - **After rotation:** the controller waits up to `rotation_recovery_timeout` seconds for a healthy tunnel and changed public IP. If recovery times out, `/rotate` returns `ok: false` with outcome `recovery_timeout` and starts a cooldown for mass/automatic rotation. If the tunnel is healthy but the IP did not change, the outcome is `healthy_ip_unchanged`.
 - **Verified egress IP:** `/pool?fresh=1` verifies each healthy backend by requesting `egress_verify_target` through that backend's HTTP proxy and caches the resulting `verified_proxy_ip` for `egress_verify_ttl` seconds. Diversity checks prefer fresh verified proxy IPs over gluetun's `/v1/publicip/ip` value. A `public_ip_mismatch` is visible degraded state, but not an automatic repair trigger by itself.
+- **Controller auth:** `controller_auth_enabled: true` protects the dashboard, `/pool`, `/metrics`, `/rotate*`, and `/repair/duplicate-ip` with `X-Chamosel-Auth`. The CLI reads `CONTROLLER_AUTH_TOKEN` from the environment, `.env`, or `global_settings.controller_auth_token` and sends the header automatically. `/health` remains public for liveness checks. If `api_bind` is not loopback, generation fails unless controller auth is enabled.
 - **Pool status:** `/pool`, `/metrics`, `status`, and the dashboard expose `pool_status` as `healthy`, `degraded`, or `down`. The pool is degraded when state is stale after controller restart, too few backends are healthy, duplicate verified proxy IPs or fallback public IPs are detected, egress verification fails, public IP differs from verified proxy IP, or recent rotation recovery/proxy checks failed. With `auto_repair_duplicate_ips: true`, duplicate-IP detection after polling or `/pool?fresh=1` schedules one non-forced background rotation for a duplicate backend, respecting cooldown and `duplicate_repair_retry_cooldown`.
 - **Mass rotation:** `/rotate/all` rotates eligible backends in batches. The defaults are `rotate_all_batch_size: 2` and `rotate_all_batch_delay_seconds: 2`; keep `rotate_cooldown > 0` for live providers so repeated recovery failures back off instead of hammering the same account.
 - **Control API key:** `api_key` is not a paid gluetun key and not a provider subscription key. It is a local secret shared between gluetun's control server and the chamosel controller. If you set it in `config.yml`, `generate` writes the same value to `.env` so Docker Compose can pass it to the controller. If `.env` and `config.yml` disagree, generation fails instead of creating a split-brain auth setup.
+- **Controller auth token:** `controller_auth_token` is separate from `api_key`. It is the operator-facing chamosel controller token, not a gluetun/provider key. When auth is enabled and no token is configured, `generate` creates one in `.env`.
 - **Provider secrets:** keep VPN credentials out of `config.yml` when possible. Copy `.env.example` to `.env.local`, set `global_settings.env_file: .env.local`, and put values such as `WIREGUARD_PRIVATE_KEY` there. `.env.local` is ignored by Git.
 - **Image freshness:** `chamosel.py up` runs `docker compose pull --ignore-buildable` before starting the stack so runtime images such as gluetun do not silently stay stale. Use `chamosel.py up --no-pull` when you intentionally want to use only local cached images.
 - **Surfshark:** start live validation around `num_containers: 5` and increase carefully. Frequent `rotate/all` can run into provider recovery delays even when leak-only verification is stable.
-- **API/dashboard exposure:** ports `8800` and `8404` bind to localhost by default. If you set `api_bind` or `stats_bind` to `0.0.0.0`, put them behind firewall/reverse-proxy auth.
+- **API/dashboard exposure:** ports `8800` and `8404` bind to localhost by default. If you set `api_bind` to `0.0.0.0`, enable `controller_auth_enabled: true`; keep firewall/reverse-proxy controls in front of any public host bind. HAProxy stats still needs network-level protection if `stats_bind` is public.
 - **Docker volumes:** `chamosel.py down` preserves volumes (gluetun servers cache + state). Use `docker compose down -v` to wipe everything.
 
 ## Requirements

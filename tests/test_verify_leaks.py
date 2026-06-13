@@ -19,6 +19,7 @@ def load_chamosel():
 
 class VerifyLeakTests(unittest.TestCase):
     def setUp(self):
+        self.old_controller_token = os.environ.pop("CONTROLLER_AUTH_TOKEN", None)
         self.old_cwd = os.getcwd()
         self.tmp = tempfile.TemporaryDirectory()
         os.chdir(self.tmp.name)
@@ -27,6 +28,10 @@ class VerifyLeakTests(unittest.TestCase):
 
     def tearDown(self):
         os.chdir(self.old_cwd)
+        if self.old_controller_token is not None:
+            os.environ["CONTROLLER_AUTH_TOKEN"] = self.old_controller_token
+        else:
+            os.environ.pop("CONTROLLER_AUTH_TOKEN", None)
         self.tmp.cleanup()
 
     def pool(self, healthy=True):
@@ -66,6 +71,19 @@ class VerifyLeakTests(unittest.TestCase):
         self.assertNotIn("GLUETUN_API_KEY", rendered)
         self.assertNotIn("WIREGUARD_PRIVATE_KEY", rendered)
         self.assertNotIn("vpn-password", rendered)
+
+    def test_controller_auth_headers_use_config_token_without_output(self):
+        cfg = {
+            "global_settings": {
+                "controller_auth_enabled": True,
+                "controller_auth_token": "controller-secret",
+            },
+            "vpn_providers": {"surfshark": {}},
+        }
+
+        headers = self.chamosel.controller_auth_headers(cfg)
+
+        self.assertEqual({"X-Chamosel-Auth": "controller-secret"}, headers)
 
     def test_verify_leaks_success_when_backend_ip_differs_from_host(self):
         self.chamosel.fetch_direct_ip = lambda target, timeout: ("149.232.250.241", {"ip": "149.232.250.241"})
@@ -267,7 +285,9 @@ class VerifyLeakTests(unittest.TestCase):
         self.assertIn("--target", help_text)
         self.assertIn("--iterations", help_text)
         self.assertIn("--mode", help_text)
+        self.assertIn("--repair", help_text)
         self.assertNotIn("GLUETUN_API_KEY", help_text)
+        self.assertNotIn("CONTROLLER_AUTH_TOKEN", help_text)
         self.assertNotIn("WIREGUARD_PRIVATE_KEY", help_text)
 
     def test_status_output_contains_latest_outcome_and_cooldown(self):
@@ -413,6 +433,94 @@ class VerifyLeakTests(unittest.TestCase):
         self.assertEqual(["surfshark_4"], report["repair_decision"]["targets"])
         self.assertIn("Repair decision: repair_in_progress", rendered)
 
+    def test_doctor_repair_calls_repair_endpoint_for_duplicate_ip(self):
+        self.chamosel.compose_check = lambda args: {"ok": True, "returncode": 0, "stdout": "ok", "stderr": ""}
+        self.chamosel.tcp_check = lambda host, port, timeout=2: {"ok": True, "error": None}
+        calls = []
+        cfg = {
+            "global_settings": {
+                "api_port": 8800,
+                "stats_port": 8404,
+                "controller_auth_enabled": True,
+                "controller_auth_token": "controller-secret",
+            },
+            "vpn_providers": {"surfshark": {"num_containers": 2}},
+        }
+
+        def fake_api(cfg, method, path, timeout=15):
+            calls.append((method, path))
+            if path == "/health":
+                return {"ok": True, "status": 200, "payload": {"status": "ok"}, "error": None}
+            if path == "/pool?fresh=1":
+                return {
+                    "ok": True,
+                    "status": 200,
+                    "payload": {
+                        "healthy": 2,
+                        "count": 2,
+                        "pool_status": "degraded",
+                        "state_fresh": True,
+                        "degraded_reasons": ["verified_duplicate_proxy_ip"],
+                        "duplicate_repair": {
+                            "enabled": True,
+                            "in_flight": [],
+                            "backoff_remaining": {},
+                        },
+                    },
+                    "error": None,
+                }
+            if path == "/repair/duplicate-ip":
+                return {
+                    "ok": True,
+                    "status": 200,
+                    "payload": {"ok": True, "attempted": True, "outcome": "repair_attempted"},
+                    "error": None,
+                }
+            raise AssertionError(path)
+
+        self.chamosel.api_call_result = fake_api
+
+        report = self.chamosel.doctor_report(cfg, repair=True)
+        rendered = self.chamosel.render_doctor_report(report)
+
+        self.assertIn(("POST", "/repair/duplicate-ip"), calls)
+        self.assertEqual("repair_attempted", report["repair_result"]["payload"]["outcome"])
+        self.assertIn("Repair result: repair_attempted", rendered)
+        self.assertNotIn("controller-secret", json.dumps(report))
+
+    def test_doctor_repair_skips_public_ip_mismatch_monitor_only(self):
+        self.chamosel.compose_check = lambda args: {"ok": True, "returncode": 0, "stdout": "ok", "stderr": ""}
+        self.chamosel.tcp_check = lambda host, port, timeout=2: {"ok": True, "error": None}
+        calls = []
+
+        def fake_api(cfg, method, path, timeout=15):
+            calls.append((method, path))
+            if path == "/health":
+                return {"ok": True, "status": 200, "payload": {"status": "ok"}, "error": None}
+            if path == "/pool?fresh=1":
+                return {
+                    "ok": True,
+                    "status": 200,
+                    "payload": {
+                        "healthy": 2,
+                        "count": 2,
+                        "pool_status": "degraded",
+                        "state_fresh": True,
+                        "degraded_reasons": ["public_ip_mismatch"],
+                        "duplicate_repair": {"enabled": True},
+                    },
+                    "error": None,
+                }
+            raise AssertionError(path)
+
+        self.chamosel.api_call_result = fake_api
+
+        report = self.chamosel.doctor_report(self.cfg, repair=True)
+
+        self.assertNotIn(("POST", "/repair/duplicate-ip"), calls)
+        self.assertEqual("monitor", report["repair_decision"]["action"])
+        self.assertEqual("skipped", report["repair_result"]["payload"]["outcome"])
+
     def test_doctor_reports_verified_duplicate_ip_repair_requested(self):
         decision = self.chamosel.doctor_repair_decision(
             True,
@@ -495,6 +603,13 @@ class VerifyLeakTests(unittest.TestCase):
         self.assertEqual("rotation", args.stress_mode)
         self.assertEqual(12, args.timeout)
         self.assertEqual("/tmp/chamosel-stress", args.out_dir)
+
+    def test_doctor_parser_accepts_repair(self):
+        args = self.chamosel.build_parser().parse_args(["doctor", "--repair", "--json"])
+
+        self.assertEqual("doctor", args.action)
+        self.assertTrue(args.repair)
+        self.assertTrue(args.json_output)
 
     def test_leak_only_stress_does_not_rotate_and_summarizes_report(self):
         rotate_calls = []
