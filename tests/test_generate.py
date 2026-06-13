@@ -97,6 +97,18 @@ class GenerateTests(unittest.TestCase):
         self.assertIn("0.0.0.0:8800:8800/tcp", compose["services"]["controller"]["ports"])
         self.assertIn("0.0.0.0:8404:8404/tcp", compose["services"]["haproxy"]["ports"])
 
+    def test_provider_env_file_renders_when_configured(self):
+        cfg = self.base_config()
+        cfg["global_settings"]["env_file"] = ".env.local"
+        cfg["vpn_providers"]["surfshark"]["env"].pop("WIREGUARD_PRIVATE_KEY")
+
+        self.chamosel.generate(cfg)
+        compose = yaml.safe_load(Path("docker-compose.yml").read_text())
+        service = compose["services"]["surfshark_0"]
+
+        self.assertEqual([".env.local"], service["env_file"])
+        self.assertNotIn("WIREGUARD_PRIVATE_KEY", service["environment"])
+
     def test_env_file_and_config_key_conflict_fails(self):
         Path(".env").write_text("GLUETUN_API_KEY=other-secret\n")
 

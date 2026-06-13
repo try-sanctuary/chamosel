@@ -2,6 +2,7 @@ config.yml
 docker-compose.yml
 haproxy.cfg
 .env
+.env.local
 state.json
 .specify/
 .agents/

@@ -93,6 +93,7 @@ global_settings:
   stats_port: 8404
   stats_bind: 127.0.0.1
   api_port: 8800
+  # env_file: .env.local    # optional provider secrets file for gluetun services
   image: qmcgaw/gluetun:v3
   balance: roundrobin        # or leastconn
   auto_rotate_seconds: 0     # 0 = off; e.g. 1800 = rotate one every 30 min
@@ -127,6 +128,7 @@ $res = $client->fetchWithRetry('https://example.com/products');
 - **Per-request IP rotation:** with `mode tcp`, one keep-alive connection pins one exit IP. Set `CURLOPT_FRESH_CONNECT` in PHP (already done in the example) or use `balance leastconn`.
 - **After rotation:** the controller waits up to `rotation_recovery_timeout` seconds for a healthy tunnel and changed public IP. If recovery times out, `/rotate` returns `ok: false` with outcome `recovery_timeout`.
 - **Control API key:** `api_key` is not a paid gluetun key and not a provider subscription key. It is a local secret shared between gluetun's control server and the chamosel controller. If you set it in `config.yml`, `generate` writes the same value to `.env` so Docker Compose can pass it to the controller. If `.env` and `config.yml` disagree, generation fails instead of creating a split-brain auth setup.
+- **Provider secrets:** keep VPN credentials out of `config.yml` when possible. Copy `.env.example` to `.env.local`, set `global_settings.env_file: .env.local`, and put values such as `WIREGUARD_PRIVATE_KEY` there. `.env.local` is ignored by Git.
 - **Surfshark:** caps simultaneous connections per plan. Size `num_containers` accordingly.
 - **API/dashboard exposure:** ports `8800` and `8404` bind to localhost by default. If you set `api_bind` or `stats_bind` to `0.0.0.0`, put them behind firewall/reverse-proxy auth.
 - **Docker volumes:** `chamosel.py down` preserves volumes (gluetun servers cache + state). Use `docker compose down -v` to wipe everything.

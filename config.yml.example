@@ -4,6 +4,7 @@ global_settings:
   stats_port: 8404          # HAProxy stats UI at /stats
   stats_bind: 127.0.0.1     # stats host bind; keep local by default on VPS
   api_port: 8800            # controller REST API + dashboard + /metrics
+  # env_file: .env.local    # optional provider secrets file for generated gluetun services
   image: qmcgaw/gluetun:v3
   haproxy_image: haproxy:3.0-alpine
   balance: roundrobin       # or leastconn

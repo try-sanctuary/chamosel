@@ -8,6 +8,10 @@ services:
       - NET_ADMIN
     devices:
       - /dev/net/tun
+{% if env_file %}
+    env_file:
+      - {{ env_file | tojson }}
+{% endif %}
     environment:
       HTTPPROXY: "on"
       HTTPPROXY_LISTENING_ADDRESS: ":8888"
