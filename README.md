@@ -54,6 +54,7 @@ curl -x http://localhost:8888 https://ipinfo.io/ip
 | `chamosel.py doctor` | Diagnose compose/controller/pool/stats/env/image freshness state |
 | `chamosel.py doctor --repair` | Diagnose, then request one safe duplicate-IP repair action |
 | `chamosel.py verify-leaks` | Verify backend proxy exit IPs do not expose the host IP |
+| `chamosel.py verify-dns` | Verify backend DNS resolvers do not look suspicious |
 | `chamosel.py stress` | Repeat leak-only or rotation stress validation |
 
 ## Doctor
@@ -100,6 +101,21 @@ What it does not guarantee:
 - SOCKS clients using local DNS. Use remote DNS behavior such as `socks5h://` when a SOCKS client is involved.
 - Traffic that bypasses chamosel entirely.
 
+## DNS Leak Verification
+
+Run DNS leak verification after `doctor` and `verify-leaks`, without rotating tunnels:
+
+```bash
+python3 chamosel.py doctor
+python3 chamosel.py verify-leaks
+python3 chamosel.py verify-dns
+python3 chamosel.py verify-dns --json
+```
+
+`verify-dns` uses the same backend proxy path as `verify-leaks`, but asks a DNS leak challenge service to report which DNS resolvers were observed for each backend. The report shows the backend connection IP, connection ASN, resolver count, resolver ASN values, and a result per backend.
+
+A `suspected` or `resolver ASN differs from connection ASN` result is an investigation signal. It does not automatically rotate or repair anything. Some VPN providers can use DNS infrastructure with different metadata, so compare the result with provider documentation before changing live settings.
+
 ## Stress Validation
 
 Leak-only stress repeats leak verification without rotating tunnels:
@@ -120,6 +136,7 @@ Use the three validation commands for different jobs:
 
 - `doctor`: fast local stack diagnostics, no external leak target.
 - `verify-leaks`: one end-to-end proxy leak check for each healthy backend.
+- `verify-dns`: one DNS resolver leak check for each healthy backend.
 - `stress`: repeated validation, optionally with cautious rotation.
 
 For Surfshark-style live testing, start conservatively with `num_containers: 5`, `rotate_cooldown: 60`, and `rotation_recovery_timeout: 60` to `90`. Larger pools can work, but frequent mass rotation may hit provider recovery limits. `rotate/all` skips backends in cooldown, rotates eligible backends in small batches, and continues when one backend times out. Duplicate verified proxy IPs are treated as degraded; after a fresh health check the controller schedules one background repair rotation for a duplicate backend when it is not in cooldown. If repair fails, `duplicate_repair_retry_cooldown` prevents immediate retry loops. If gluetun's control API public IP differs from the verified proxy exit IP, chamosel marks the pool degraded for visibility but does not rotate unless the verified proxy IP is duplicated.

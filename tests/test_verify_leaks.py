@@ -72,6 +72,141 @@ class VerifyLeakTests(unittest.TestCase):
         self.assertNotIn("WIREGUARD_PRIVATE_KEY", rendered)
         self.assertNotIn("vpn-password", rendered)
 
+    def test_dns_probe_command_does_not_embed_secret_values(self):
+        cmd = self.chamosel.build_backend_dns_probe_cmd("surfshark_0", 30)
+        rendered = " ".join(cmd)
+
+        self.assertIn("docker compose -f docker-compose.yml exec -T controller", rendered)
+        self.assertIn("http://surfshark_0:8888", rendered)
+        self.assertIn("bash.ws", rendered)
+        self.assertNotIn("GLUETUN_API_KEY", rendered)
+        self.assertNotIn("WIREGUARD_PRIVATE_KEY", rendered)
+        self.assertNotIn("vpn-password", rendered)
+
+    def dns_payload(self, connection_asn="AS9009", dns_asn="AS9009"):
+        return [
+            {
+                "type": "ip",
+                "ip": "45.134.140.5",
+                "country_name": "Germany",
+                "asn": connection_asn,
+            },
+            {
+                "type": "dns",
+                "ip": "45.134.140.6",
+                "country_name": "Germany",
+                "asn": dns_asn,
+            },
+            {
+                "type": "conclusion",
+                "ip": "DNS resolver ASN matches connection ASN",
+            },
+        ]
+
+    def test_normalize_dns_probe_result_accepts_bashws_payload(self):
+        result = self.chamosel.normalize_dns_probe_result(
+            {"name": "surfshark_0", "healthy": True, "status": "healthy"},
+            self.dns_payload(),
+        )
+
+        self.assertTrue(result["dns_ok"])
+        self.assertFalse(result["suspected_leak"])
+        self.assertEqual("45.134.140.5", result["connection_ip"])
+        self.assertEqual("AS9009", result["connection_asn"])
+        self.assertEqual(1, result["resolver_count"])
+        self.assertEqual("45.134.140.6", result["dns_servers"][0]["ip"])
+        self.assertEqual("Germany", result["dns_servers"][0]["country"])
+        self.assertEqual("AS9009", result["dns_servers"][0]["asn"])
+        self.assertTrue(result["asn_match"])
+        self.assertEqual(["DNS resolver ASN matches connection ASN"], result["conclusions"])
+
+    def test_verify_dns_leaks_success(self):
+        self.chamosel.fetch_pool_state = lambda cfg: self.pool()
+        self.chamosel.run_backend_dns_probe = lambda instance, timeout: self.dns_payload()
+
+        result = self.chamosel.verify_dns_leaks(self.cfg)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual("bash.ws", result["target"])
+        self.assertEqual(1, result["verified_count"])
+        self.assertEqual(1, result["total_count"])
+        self.assertTrue(result["instances"][0]["dns_ok"])
+
+    def test_verify_dns_leaks_flags_suspicious_asn_mismatch(self):
+        self.chamosel.fetch_pool_state = lambda cfg: self.pool()
+        self.chamosel.run_backend_dns_probe = lambda instance, timeout: self.dns_payload(dns_asn="AS15169")
+
+        result = self.chamosel.verify_dns_leaks(self.cfg)
+
+        self.assertFalse(result["ok"])
+        item = result["instances"][0]
+        self.assertFalse(item["dns_ok"])
+        self.assertTrue(item["suspected_leak"])
+        self.assertFalse(item["asn_match"])
+        self.assertIn("resolver ASN differs", item["error"])
+
+    def test_verify_dns_leaks_reports_unhealthy_backend(self):
+        self.chamosel.fetch_pool_state = lambda cfg: self.pool(healthy=False)
+
+        result = self.chamosel.verify_dns_leaks(self.cfg)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(1, result["total_count"])
+        self.assertEqual(0, result["verified_count"])
+        self.assertIn("controller status is down", result["instances"][0]["error"])
+
+    def test_verify_dns_leaks_reports_probe_failure(self):
+        self.chamosel.fetch_pool_state = lambda cfg: self.pool()
+
+        def fail_probe(instance, timeout):
+            raise self.chamosel.LeakVerificationError("dns probe timed out")
+
+        self.chamosel.run_backend_dns_probe = fail_probe
+
+        result = self.chamosel.verify_dns_leaks(self.cfg)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual("dns probe timed out", result["instances"][0]["error"])
+
+    def test_verify_dns_json_output_shape_and_secret_safety(self):
+        self.chamosel.verify_dns_leaks = lambda cfg, timeout=30: {
+            "ok": False,
+            "target": "bash.ws",
+            "verified_count": 0,
+            "total_count": 1,
+            "error": "one or more backends failed DNS leak verification",
+            "instances": [
+                {
+                    "name": "surfshark_0",
+                    "controller_status": "healthy",
+                    "healthy": True,
+                    "connection_ip": "45.134.140.5",
+                    "connection_asn": "AS9009",
+                    "dns_servers": [{"ip": "8.8.8.8", "country": "United States", "asn": "AS15169"}],
+                    "resolver_count": 1,
+                    "asn_match": False,
+                    "suspected_leak": True,
+                    "dns_ok": False,
+                    "conclusions": [],
+                    "error": "resolver ASN differs from connection ASN",
+                }
+            ],
+        }
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            with self.assertRaises(SystemExit) as raised:
+                self.chamosel.cmd_verify_dns(self.cfg, json_output=True)
+        rendered = buf.getvalue()
+        payload = json.loads(rendered)
+
+        self.assertEqual(1, raised.exception.code)
+        self.assertFalse(payload["ok"])
+        self.assertIn("dns_servers", payload["instances"][0])
+        self.assertNotIn("GLUETUN_API_KEY", rendered)
+        self.assertNotIn("CONTROLLER_AUTH_TOKEN", rendered)
+        self.assertNotIn("WIREGUARD_PRIVATE_KEY", rendered)
+
     def test_controller_auth_headers_use_config_token_without_output(self):
         cfg = {
             "global_settings": {
@@ -278,6 +413,7 @@ class VerifyLeakTests(unittest.TestCase):
         help_text = parser.format_help()
 
         self.assertIn("verify-leaks", help_text)
+        self.assertIn("verify-dns", help_text)
         self.assertIn("stress", help_text)
         self.assertIn("doctor", help_text)
         self.assertIn("--json", help_text)
@@ -703,8 +839,14 @@ class VerifyLeakTests(unittest.TestCase):
         readme = (ROOT / "README.md").read_text()
 
         self.assertIn("## Leak Verification", readme)
+        self.assertIn("## DNS Leak Verification", readme)
         self.assertIn("python3 chamosel.py verify-leaks", readme)
         self.assertIn("python3 chamosel.py verify-leaks --json", readme)
+        self.assertIn("python3 chamosel.py verify-dns", readme)
+        self.assertIn("python3 chamosel.py verify-dns --json", readme)
+        self.assertIn("doctor", readme)
+        self.assertIn("without rotating", readme)
+        self.assertIn("suspected", readme)
         self.assertIn("direct host IP differs", readme)
         self.assertIn("Browser WebRTC", readme)
         self.assertIn("socks5h://", readme)
