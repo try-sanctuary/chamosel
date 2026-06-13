@@ -51,6 +51,37 @@ curl -x http://localhost:8888 https://ipinfo.io/ip
 | `chamosel.py down` | Stop the stack (volumes preserved) |
 | `chamosel.py status` | Health + public IP + rotation count per instance |
 | `chamosel.py rotate [name\|all]` | Ask the controller to rotate |
+| `chamosel.py verify-leaks` | Verify backend proxy exit IPs do not expose the host IP |
+
+## Leak Verification
+
+Run a local leak check before trusting the pool:
+
+```bash
+python3 chamosel.py verify-leaks
+python3 chamosel.py verify-leaks --json
+```
+
+By default, the command checks `https://ifconfig.co/json`. You can tune the target and request timeout:
+
+```bash
+python3 chamosel.py verify-leaks --target https://ifconfig.co/json --timeout 30
+```
+
+The check verifies that:
+
+- the direct host IP differs from every checked backend proxy exit IP
+- each healthy backend can reach the target through its own VPN proxy path
+- controller health and backend verification agree well enough to report PASS
+
+The check fails closed when the controller is unreachable, the host IP cannot be determined, a backend is unhealthy, a backend cannot proxy the target, a backend returns no public IP, or a backend returns the same IP as the host.
+
+What it does not guarantee:
+
+- Browser WebRTC leak prevention. Harden browsers separately.
+- Clients that resolve DNS locally before using a proxy. HTTP proxy clients should send hostnames through the proxy path.
+- SOCKS clients using local DNS. Use remote DNS behavior such as `socks5h://` when a SOCKS client is involved.
+- Traffic that bypasses chamosel entirely.
 
 ## REST API (controller, port 8800)
 
