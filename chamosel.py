@@ -14,7 +14,8 @@ Container management modes:
 Usage:
     chamosel.py genkey            # print a fresh gluetun control-server API key
     chamosel.py generate          # render compose + haproxy.cfg (+ .env)
-    chamosel.py up                # generate + docker compose up -d
+    chamosel.py up                # generate + pull images + docker compose up -d
+    chamosel.py up --no-pull      # generate + docker compose up -d using local images
     chamosel.py down              # docker compose down
     chamosel.py status            # call controller /pool for live status
     chamosel.py rotate [name|all] # ask the controller to rotate
@@ -248,8 +249,13 @@ def api_call(cfg: dict, method: str, path: str):
         log.error("controller call %s %s failed: %s", method, path, e); sys.exit(1)
 
 
-def cmd_up(cfg):
+def cmd_up(cfg, pull_images: bool = True):
     generate(cfg)
+    if pull_images:
+        log.info("Pulling latest runtime images (use --no-pull to skip)")
+        compose_cmd(["pull", "--ignore-buildable"])
+    else:
+        log.info("Skipping image pull (--no-pull)")
     compose_cmd(["up", "-d", "--build", "--remove-orphans"])
     log.info("Pool up. Proxy http://localhost:%s | API+dashboard http://localhost:%s | Stats http://localhost:%s/stats",
              gset(cfg, "proxy_port"), gset(cfg, "api_port"), gset(cfg, "stats_port"))
@@ -277,12 +283,14 @@ def main():
     p.add_argument("action", choices=["genkey", "generate", "up", "down", "status", "rotate"])
     p.add_argument("target", nargs="?", help="for rotate: instance name or 'all'")
     p.add_argument("-c", "--config", default=CONFIG_FILE)
+    p.add_argument("--no-pull", action="store_true",
+                   help="for up: skip docker compose pull and use local images")
     a = p.parse_args()
     if a.action == "genkey":
         print(gen_api_key()); return
     cfg = load_config(a.config)
     if a.action == "generate": generate(cfg)
-    elif a.action == "up": cmd_up(cfg)
+    elif a.action == "up": cmd_up(cfg, pull_images=not a.no_pull)
     elif a.action == "down": compose_cmd(["down"])
     elif a.action == "status": cmd_status(cfg)
     elif a.action == "rotate": cmd_rotate(cfg, a.target)

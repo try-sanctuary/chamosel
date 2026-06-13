@@ -109,6 +109,37 @@ class GenerateTests(unittest.TestCase):
         self.assertEqual([".env.local"], service["env_file"])
         self.assertNotIn("WIREGUARD_PRIVATE_KEY", service["environment"])
 
+    def test_cmd_up_pulls_runtime_images_by_default(self):
+        calls = []
+        self.chamosel.generate = lambda cfg: calls.append(("generate", None))
+        self.chamosel.compose_cmd = lambda args, capture=False: calls.append(("compose", args))
+
+        self.chamosel.cmd_up(self.base_config())
+
+        self.assertEqual(
+            [
+                ("generate", None),
+                ("compose", ["pull", "--ignore-buildable"]),
+                ("compose", ["up", "-d", "--build", "--remove-orphans"]),
+            ],
+            calls,
+        )
+
+    def test_cmd_up_can_skip_runtime_image_pull(self):
+        calls = []
+        self.chamosel.generate = lambda cfg: calls.append(("generate", None))
+        self.chamosel.compose_cmd = lambda args, capture=False: calls.append(("compose", args))
+
+        self.chamosel.cmd_up(self.base_config(), pull_images=False)
+
+        self.assertEqual(
+            [
+                ("generate", None),
+                ("compose", ["up", "-d", "--build", "--remove-orphans"]),
+            ],
+            calls,
+        )
+
     def test_env_file_and_config_key_conflict_fails(self):
         Path(".env").write_text("GLUETUN_API_KEY=other-secret\n")
 

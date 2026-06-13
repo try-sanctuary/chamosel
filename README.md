@@ -30,7 +30,7 @@ scraper ──http_proxy──> HAProxy :8888 ──tcp──> gluetun_0 ── 
 
 ```bash
 cp config.yml.example config.yml   # add your VPN credentials
-python3 chamosel.py up             # generates key + configs, docker compose up
+python3 chamosel.py up             # generate configs, pull latest images, compose up
 
 # Proxy:     http://localhost:8888
 # Dashboard: http://localhost:8800       # bound to 127.0.0.1 by default
@@ -46,7 +46,8 @@ curl -x http://localhost:8888 https://ipinfo.io/ip
 |---|---|
 | `chamosel.py genkey` | Print a fresh gluetun control-server API key |
 | `chamosel.py generate` | Render `docker-compose.yml` + `haproxy.cfg` (+ `.env`) |
-| `chamosel.py up` | Generate, build the controller image, and start the stack |
+| `chamosel.py up` | Generate, pull latest runtime images, build the controller image, and start the stack |
+| `chamosel.py up --no-pull` | Start from local image cache without pulling newer runtime images |
 | `chamosel.py down` | Stop the stack (volumes preserved) |
 | `chamosel.py status` | Health + public IP + rotation count per instance |
 | `chamosel.py rotate [name\|all]` | Ask the controller to rotate |
@@ -129,6 +130,7 @@ $res = $client->fetchWithRetry('https://example.com/products');
 - **After rotation:** the controller waits up to `rotation_recovery_timeout` seconds for a healthy tunnel and changed public IP. If recovery times out, `/rotate` returns `ok: false` with outcome `recovery_timeout`.
 - **Control API key:** `api_key` is not a paid gluetun key and not a provider subscription key. It is a local secret shared between gluetun's control server and the chamosel controller. If you set it in `config.yml`, `generate` writes the same value to `.env` so Docker Compose can pass it to the controller. If `.env` and `config.yml` disagree, generation fails instead of creating a split-brain auth setup.
 - **Provider secrets:** keep VPN credentials out of `config.yml` when possible. Copy `.env.example` to `.env.local`, set `global_settings.env_file: .env.local`, and put values such as `WIREGUARD_PRIVATE_KEY` there. `.env.local` is ignored by Git.
+- **Image freshness:** `chamosel.py up` runs `docker compose pull --ignore-buildable` before starting the stack so runtime images such as gluetun do not silently stay stale. Use `chamosel.py up --no-pull` when you intentionally want to use only local cached images.
 - **Surfshark:** caps simultaneous connections per plan. Size `num_containers` accordingly.
 - **API/dashboard exposure:** ports `8800` and `8404` bind to localhost by default. If you set `api_bind` or `stats_bind` to `0.0.0.0`, put them behind firewall/reverse-proxy auth.
 - **Docker volumes:** `chamosel.py down` preserves volumes (gluetun servers cache + state). Use `docker compose down -v` to wipe everything.
