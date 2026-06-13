@@ -19,6 +19,7 @@ def load_chamosel():
 class GenerateTests(unittest.TestCase):
     def setUp(self):
         self.old_env = os.environ.pop("GLUETUN_API_KEY", None)
+        self.old_controller_token = os.environ.pop("CONTROLLER_AUTH_TOKEN", None)
         self.old_cwd = os.getcwd()
         self.tmp = tempfile.TemporaryDirectory()
         os.chdir(self.tmp.name)
@@ -30,6 +31,10 @@ class GenerateTests(unittest.TestCase):
             os.environ["GLUETUN_API_KEY"] = self.old_env
         else:
             os.environ.pop("GLUETUN_API_KEY", None)
+        if self.old_controller_token is not None:
+            os.environ["CONTROLLER_AUTH_TOKEN"] = self.old_controller_token
+        else:
+            os.environ.pop("CONTROLLER_AUTH_TOKEN", None)
         self.tmp.cleanup()
 
     def base_config(self):
@@ -64,6 +69,8 @@ class GenerateTests(unittest.TestCase):
         self.assertIn("GLUETUN_API_KEY=config-secret\n", env_text)
         controller_env = compose["services"]["controller"]["environment"]
         self.assertEqual("${GLUETUN_API_KEY}", controller_env["GLUETUN_API_KEY"])
+        self.assertEqual("false", controller_env["CONTROLLER_AUTH_ENABLED"])
+        self.assertEqual("${CONTROLLER_AUTH_TOKEN}", controller_env["CONTROLLER_AUTH_TOKEN"])
 
         gluetun_env = compose["services"]["surfshark_0"]["environment"]
         self.assertIn("config-secret", gluetun_env["HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE"])
@@ -86,14 +93,32 @@ class GenerateTests(unittest.TestCase):
         self.assertIn("127.0.0.1:8800:8800/tcp", compose["services"]["controller"]["ports"])
         self.assertIn("127.0.0.1:8404:8404/tcp", compose["services"]["haproxy"]["ports"])
 
-    def test_explicit_remote_bind_renders_when_configured(self):
+    def test_explicit_remote_bind_requires_controller_auth(self):
         cfg = self.base_config()
         cfg["global_settings"]["api_bind"] = "0.0.0.0"
         cfg["global_settings"]["stats_bind"] = "0.0.0.0"
 
+        with self.assertLogs("chamosel", level="ERROR") as logs:
+            with self.assertRaises(SystemExit):
+                self.chamosel.generate(cfg)
+
+        self.assertNotIn("config-secret", "\n".join(logs.output))
+
+    def test_explicit_remote_bind_renders_when_controller_auth_enabled(self):
+        cfg = self.base_config()
+        cfg["global_settings"]["api_bind"] = "0.0.0.0"
+        cfg["global_settings"]["stats_bind"] = "0.0.0.0"
+        cfg["global_settings"]["controller_auth_enabled"] = True
+        cfg["global_settings"]["controller_auth_token"] = "controller-secret"
+
         self.chamosel.generate(cfg)
         compose = yaml.safe_load(Path("docker-compose.yml").read_text())
 
+        env_text = Path(".env").read_text()
+        controller_env = compose["services"]["controller"]["environment"]
+        self.assertIn("CONTROLLER_AUTH_TOKEN=controller-secret\n", env_text)
+        self.assertEqual("true", controller_env["CONTROLLER_AUTH_ENABLED"])
+        self.assertEqual("${CONTROLLER_AUTH_TOKEN}", controller_env["CONTROLLER_AUTH_TOKEN"])
         self.assertIn("0.0.0.0:8800:8800/tcp", compose["services"]["controller"]["ports"])
         self.assertIn("0.0.0.0:8404:8404/tcp", compose["services"]["haproxy"]["ports"])
 
@@ -134,6 +159,7 @@ class GenerateTests(unittest.TestCase):
         self.assertEqual("12", env["EGRESS_VERIFY_TIMEOUT"])
         self.assertEqual("90", env["EGRESS_VERIFY_TTL"])
         self.assertEqual("false", env["EGRESS_VERIFY_ON_FRESH"])
+        self.assertEqual("false", env["CONTROLLER_AUTH_ENABLED"])
 
     def test_cmd_up_pulls_runtime_images_by_default(self):
         calls = []

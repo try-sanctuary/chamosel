@@ -132,6 +132,79 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(200, captured["code"])
         self.assertEqual("9.9.9.9", captured["payload"]["instances"][0]["public_ip"])
 
+    def test_controller_auth_rejects_protected_get_without_token(self):
+        ctrl = load_controller(
+            self.tmp.name,
+            env_overrides={"CONTROLLER_AUTH_ENABLED": "true", "CONTROLLER_AUTH_TOKEN": "controller-token"},
+        )
+        called = {"refresh": False}
+        captured = {}
+
+        handler = ctrl.Handler.__new__(ctrl.Handler)
+        handler.path = "/pool?fresh=1"
+        handler.headers = {}
+        handler._json = lambda code, payload: captured.update({"code": code, "payload": payload})
+        ctrl.refresh_instances = lambda *args, **kwargs: called.update({"refresh": True})
+
+        handler.do_GET()
+
+        self.assertEqual(401, captured["code"])
+        self.assertEqual({"error": "unauthorized"}, captured["payload"])
+        self.assertFalse(called["refresh"])
+
+    def test_controller_auth_allows_protected_get_with_token(self):
+        ctrl = load_controller(
+            self.tmp.name,
+            env_overrides={"CONTROLLER_AUTH_ENABLED": "true", "CONTROLLER_AUTH_TOKEN": "controller-token"},
+        )
+        captured = {}
+
+        handler = ctrl.Handler.__new__(ctrl.Handler)
+        handler.path = "/pool"
+        handler.headers = {"X-Chamosel-Auth": "controller-token"}
+        handler._json = lambda code, payload: captured.update({"code": code, "payload": payload})
+
+        handler.do_GET()
+
+        self.assertEqual(200, captured["code"])
+        self.assertIn("instances", captured["payload"])
+
+    def test_controller_health_remains_public_when_auth_enabled(self):
+        ctrl = load_controller(
+            self.tmp.name,
+            env_overrides={"CONTROLLER_AUTH_ENABLED": "true", "CONTROLLER_AUTH_TOKEN": "controller-token"},
+        )
+        captured = {}
+
+        handler = ctrl.Handler.__new__(ctrl.Handler)
+        handler.path = "/health"
+        handler.headers = {}
+        handler._json = lambda code, payload: captured.update({"code": code, "payload": payload})
+
+        handler.do_GET()
+
+        self.assertEqual(200, captured["code"])
+        self.assertEqual("ok", captured["payload"]["status"])
+
+    def test_controller_auth_rejects_protected_post_without_token(self):
+        ctrl = load_controller(
+            self.tmp.name,
+            env_overrides={"CONTROLLER_AUTH_ENABLED": "true", "CONTROLLER_AUTH_TOKEN": "controller-token"},
+        )
+        captured = {}
+        calls = []
+
+        handler = ctrl.Handler.__new__(ctrl.Handler)
+        handler.path = "/rotate"
+        handler.headers = {}
+        handler._json = lambda code, payload: captured.update({"code": code, "payload": payload})
+        ctrl.rotate_one_random = lambda *args, **kwargs: calls.append("rotate") or {"ok": True}
+
+        handler.do_POST()
+
+        self.assertEqual(401, captured["code"])
+        self.assertEqual([], calls)
+
     def test_rotation_success_waits_for_recovered_new_ip(self):
         commands = []
         health_calls = {"count": 0}
@@ -361,6 +434,59 @@ class ControllerTests(unittest.TestCase):
         self.ctrl.maybe_schedule_duplicate_ip_repair()
 
         self.assertEqual([], calls)
+
+    def test_duplicate_ip_repair_once_rotates_one_verified_duplicate(self):
+        calls = []
+        self.ctrl.rotate_instance = lambda instance, force=False: calls.append((instance, force)) or {
+            "instance": instance,
+            "ok": True,
+            "outcome": self.ctrl.OUTCOME_SUCCESS,
+        }
+        self.ctrl.STATE.update_health("vpn_0", True, "1.1.1.1", status=self.ctrl.STATUS_HEALTHY)
+        self.ctrl.STATE.update_health("vpn_1", True, "2.2.2.2", status=self.ctrl.STATUS_HEALTHY)
+        self.ctrl.STATE.update_verified_proxy_ip("vpn_0", "45.134.140.5")
+        self.ctrl.STATE.update_verified_proxy_ip("vpn_1", "45.134.140.5")
+
+        result = self.ctrl.repair_duplicate_ip_once()
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["attempted"])
+        self.assertEqual("vpn_1", result["target"])
+        self.assertEqual([("vpn_1", False)], calls)
+        self.assertEqual([], result["duplicate_repair"]["in_flight"])
+
+    def test_duplicate_ip_repair_once_does_not_rotate_mismatch_only(self):
+        calls = []
+        self.ctrl.rotate_instance = lambda instance, force=False: calls.append((instance, force)) or {"ok": True}
+        self.ctrl.STATE.update_health("vpn_0", True, "1.1.1.1", status=self.ctrl.STATUS_HEALTHY)
+        self.ctrl.STATE.update_health("vpn_1", True, "1.1.1.1", status=self.ctrl.STATUS_HEALTHY)
+        self.ctrl.STATE.update_verified_proxy_ip("vpn_0", "45.134.140.5")
+        self.ctrl.STATE.update_verified_proxy_ip("vpn_1", "89.187.163.10")
+
+        result = self.ctrl.repair_duplicate_ip_once()
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["attempted"])
+        self.assertEqual("no_duplicate_egress_ip", result["reason"])
+        self.assertEqual([], calls)
+
+    def test_repair_endpoint_requires_auth_and_returns_result(self):
+        ctrl = load_controller(
+            self.tmp.name,
+            env_overrides={"CONTROLLER_AUTH_ENABLED": "true", "CONTROLLER_AUTH_TOKEN": "controller-token"},
+        )
+        captured = {}
+
+        handler = ctrl.Handler.__new__(ctrl.Handler)
+        handler.path = "/repair/duplicate-ip"
+        handler.headers = {"X-Chamosel-Auth": "controller-token"}
+        handler._json = lambda code, payload: captured.update({"code": code, "payload": payload})
+        ctrl.repair_duplicate_ip_once = lambda: {"ok": True, "attempted": False, "outcome": "none"}
+
+        handler.do_POST()
+
+        self.assertEqual(200, captured["code"])
+        self.assertEqual("none", captured["payload"]["outcome"])
 
     def test_duplicate_verified_proxy_ip_refresh_schedules_one_repair_rotation(self):
         calls = []
