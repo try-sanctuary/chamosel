@@ -30,6 +30,7 @@ import os
 import secrets
 import subprocess
 import sys
+import time
 import urllib.request
 
 import yaml
@@ -42,6 +43,7 @@ HAPROXY_FILE = "haproxy.cfg"
 ENV_FILE = ".env"
 DEFAULT_LEAK_TARGET = "https://ifconfig.co/json"
 DEFAULT_LEAK_TIMEOUT = 30
+DEFAULT_STRESS_ITERATIONS = 100
 
 # In-container ports (fixed)
 GLUETUN_PROXY_PORT = 8888
@@ -247,11 +249,16 @@ class LeakVerificationError(Exception):
     """Operator-safe verification failure."""
 
 
-def api_call(cfg: dict, method: str, path: str):
+def api_timeout_for_rotation(cfg: dict) -> int:
+    count = max(1, sum(1 for _ in iter_instances(cfg)))
+    return max(15, int(gset(cfg, "rotation_recovery_timeout")) * count + 15)
+
+
+def api_call(cfg: dict, method: str, path: str, timeout: int = 15):
     url = f"http://localhost:{gset(cfg, 'api_port')}{path}"
     req = urllib.request.Request(url, method=method)
     try:
-        return json.load(urllib.request.urlopen(req, timeout=15))
+        return json.load(urllib.request.urlopen(req, timeout=timeout))
     except Exception as e:
         log.error("controller call %s %s failed: %s", method, path, e); sys.exit(1)
 
@@ -496,6 +503,130 @@ def render_leak_table(result: dict) -> str:
     return "\n".join(lines)
 
 
+def normalize_stress_mode(mode: str) -> str:
+    mode = (mode or "leak-only").strip().lower().replace("_", "-")
+    if mode == "leak-only":
+        return "leak_only"
+    if mode == "rotation":
+        return "rotation"
+    raise LeakVerificationError("mode must be leak-only or rotation")
+
+
+def init_stress_report(iterations: int, mode: str) -> dict:
+    return {
+        "ok": True,
+        "mode": mode,
+        "iterations_requested": iterations,
+        "iterations_completed": 0,
+        "backend_count": 0,
+        "verified_backend_checks": 0,
+        "leak_failures": 0,
+        "availability_failures": 0,
+        "duplicate_ip_events": 0,
+        "rotation_outcomes": {},
+        "mass_rotation_attempts": 0,
+        "partial_success_count": 0,
+        "cooldown_skip_count": 0,
+        "forced_bypass_count": 0,
+        "started_at": None,
+        "finished_at": None,
+        "total_seconds": 0.0,
+        "artifact_paths": [],
+    }
+
+
+def count_duplicate_proxy_ips(instances: list[dict]) -> int:
+    seen = set()
+    duplicates = 0
+    for item in instances:
+        ip = item.get("proxy_ip")
+        if not ip:
+            continue
+        if ip in seen:
+            duplicates += 1
+        seen.add(ip)
+    return duplicates
+
+
+def update_stress_from_leak_result(report: dict, leak: dict):
+    report["backend_count"] = max(report["backend_count"], int(leak.get("total_count") or 0))
+    report["verified_backend_checks"] += int(leak.get("verified_count") or 0)
+    instances = leak.get("instances") or []
+    report["leak_failures"] += sum(1 for item in instances if item.get("leak_detected"))
+    report["availability_failures"] += sum(1 for item in instances if item.get("error") and not item.get("leak_detected"))
+    report["duplicate_ip_events"] += count_duplicate_proxy_ips(instances)
+    if not leak.get("ok"):
+        report["ok"] = False
+
+
+def update_stress_from_rotation_result(report: dict, rotation: dict):
+    report["mass_rotation_attempts"] += 1
+    if rotation.get("outcome") == "partial_success":
+        report["partial_success_count"] += 1
+    for item in rotation.get("results") or []:
+        outcome = item.get("outcome") or "unknown"
+        report["rotation_outcomes"][outcome] = report["rotation_outcomes"].get(outcome, 0) + 1
+        if outcome == "cooldown":
+            report["cooldown_skip_count"] += 1
+        if item.get("forced_bypass"):
+            report["forced_bypass_count"] += 1
+    if not rotation.get("ok") and rotation.get("outcome") not in ("partial_success",):
+        report["ok"] = False
+
+
+def render_stress_summary(report: dict) -> str:
+    lines = [
+        f"Mode: {report['mode']}",
+        f"Iterations: {report['iterations_completed']}/{report['iterations_requested']}",
+        f"Backend checks: {report['verified_backend_checks']}",
+        f"Leak failures: {report['leak_failures']}",
+        f"Availability failures: {report['availability_failures']}",
+        f"Duplicate IP events: {report['duplicate_ip_events']}",
+    ]
+    if report["mode"] == "rotation":
+        lines.extend(
+            [
+                f"Mass rotation attempts: {report['mass_rotation_attempts']}",
+                f"Partial successes: {report['partial_success_count']}",
+                f"Cooldown skips: {report['cooldown_skip_count']}",
+                f"Rotation outcomes: {json.dumps(report['rotation_outcomes'], sort_keys=True)}",
+            ]
+        )
+    lines.append(f"Total seconds: {report['total_seconds']:.3f}")
+    lines.append(f"Stress result: {'PASS' if report.get('ok') else 'FAIL'}")
+    return "\n".join(lines)
+
+
+def run_stress(
+    cfg: dict,
+    iterations: int = DEFAULT_STRESS_ITERATIONS,
+    mode: str = "leak-only",
+    target: str = DEFAULT_LEAK_TARGET,
+    timeout: int = DEFAULT_LEAK_TIMEOUT,
+    verify_after_rotation: bool = True,
+) -> dict:
+    iterations = validate_timeout(iterations)
+    timeout = validate_timeout(timeout)
+    target = validate_target(target)
+    mode = normalize_stress_mode(mode)
+    report = init_stress_report(iterations, mode)
+    started = time.time()
+    report["started_at"] = started
+    for _ in range(iterations):
+        if mode == "rotation":
+            rotation = api_call(cfg, "POST", "/rotate/all", timeout=api_timeout_for_rotation(cfg))
+            update_stress_from_rotation_result(report, rotation)
+            if verify_after_rotation:
+                update_stress_from_leak_result(report, verify_leaks(cfg, target=target, timeout=timeout))
+        else:
+            update_stress_from_leak_result(report, verify_leaks(cfg, target=target, timeout=timeout))
+        report["iterations_completed"] += 1
+    finished = time.time()
+    report["finished_at"] = finished
+    report["total_seconds"] = round(finished - started, 3)
+    return report
+
+
 def cmd_up(cfg, pull_images: bool = True):
     generate(cfg)
     if pull_images:
@@ -510,19 +641,23 @@ def cmd_up(cfg, pull_images: bool = True):
 
 def cmd_status(cfg):
     data = api_call(cfg, "GET", "/pool")
-    print(f"{'INSTANCE':<28} {'STATUS':<20} {'HEALTHY':<8} {'ROT':<5} PUBLIC IP")
+    print(f"{'INSTANCE':<28} {'STATUS':<20} {'HEALTHY':<8} {'ROT':<5} {'OUTCOME':<22} {'COOLDOWN':<16} PUBLIC IP")
     for it in data.get("instances", []):
         status = it.get("status") or ("healthy" if it.get("healthy") else "down")
+        cooldown = float(it.get("cooldown_remaining_seconds") or 0)
+        cooldown_text = f"{cooldown:.0f}s" if cooldown > 0 else "-"
         print(
             f"{it['name']:<28} {status:<20} {str(it['healthy']):<8} "
-            f"{it['rotations']:<5} {it.get('public_ip') or '-'}"
+            f"{it['rotations']:<5} {it.get('last_rotation_outcome') or '-':<22} "
+            f"{cooldown_text:<16} {it.get('public_ip') or '-'}"
         )
     print(f"\nhealthy {data.get('healthy')}/{data.get('count')}  rotations {data.get('rotations_total')}")
 
 
 def cmd_rotate(cfg, target):
     path = "/rotate" if not target else ("/rotate/all" if target == "all" else f"/rotate/{target}")
-    print(json.dumps(api_call(cfg, "POST", path), indent=2))
+    timeout = api_timeout_for_rotation(cfg) if target == "all" else 15
+    print(json.dumps(api_call(cfg, "POST", path, timeout=timeout), indent=2))
 
 
 def cmd_verify_leaks(cfg, json_output: bool = False, timeout: int = DEFAULT_LEAK_TIMEOUT, target: str = DEFAULT_LEAK_TARGET):
@@ -535,9 +670,40 @@ def cmd_verify_leaks(cfg, json_output: bool = False, timeout: int = DEFAULT_LEAK
         raise SystemExit(1)
 
 
+def cmd_stress(
+    cfg: dict,
+    iterations: int = DEFAULT_STRESS_ITERATIONS,
+    mode: str = "leak-only",
+    timeout: int = DEFAULT_LEAK_TIMEOUT,
+    target: str = DEFAULT_LEAK_TARGET,
+    out_dir: str | None = None,
+    json_output: bool = False,
+    verify_after_rotation: bool = True,
+):
+    result = run_stress(
+        cfg,
+        iterations=iterations,
+        mode=mode,
+        target=target,
+        timeout=timeout,
+        verify_after_rotation=verify_after_rotation,
+    )
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+        summary_path = os.path.join(out_dir, "summary.json")
+        result["artifact_paths"].append(summary_path)
+        write_text(summary_path, json.dumps(result, indent=2) + "\n")
+    if json_output:
+        print(json.dumps(result, indent=2))
+    else:
+        print(render_stress_summary(result))
+    if not result.get("ok"):
+        raise SystemExit(1)
+
+
 def build_parser():
     p = argparse.ArgumentParser(description="chamosel - spin the wheel, change the skin")
-    p.add_argument("action", choices=["genkey", "generate", "up", "down", "status", "rotate", "verify-leaks"])
+    p.add_argument("action", choices=["genkey", "generate", "up", "down", "status", "rotate", "verify-leaks", "stress"])
     p.add_argument("rotate_target", nargs="?", help="for rotate: instance name or 'all'")
     p.add_argument("-c", "--config", default=CONFIG_FILE)
     p.add_argument("--no-pull", action="store_true",
@@ -547,7 +713,15 @@ def build_parser():
     p.add_argument("--timeout", type=int, default=DEFAULT_LEAK_TIMEOUT,
                    help=f"for verify-leaks: request timeout in seconds (default: {DEFAULT_LEAK_TIMEOUT})")
     p.add_argument("--target", dest="leak_target", default=DEFAULT_LEAK_TARGET,
-                   help=f"for verify-leaks: public-IP JSON target (default: {DEFAULT_LEAK_TARGET})")
+                   help=f"for verify-leaks/stress: public-IP JSON target (default: {DEFAULT_LEAK_TARGET})")
+    p.add_argument("--iterations", type=int, default=DEFAULT_STRESS_ITERATIONS,
+                   help=f"for stress: iteration count (default: {DEFAULT_STRESS_ITERATIONS})")
+    p.add_argument("--mode", dest="stress_mode", choices=["leak-only", "rotation"], default="leak-only",
+                   help="for stress: leak-only or rotation")
+    p.add_argument("--out-dir", default=None,
+                   help="for stress: write summary.json to this directory")
+    p.add_argument("--no-verify", action="store_true",
+                   help="for stress --mode rotation: skip verify-leaks after each rotation")
     return p
 
 
@@ -563,6 +737,17 @@ def main():
     elif a.action == "status": cmd_status(cfg)
     elif a.action == "rotate": cmd_rotate(cfg, a.rotate_target)
     elif a.action == "verify-leaks": cmd_verify_leaks(cfg, a.json_output, a.timeout, a.leak_target)
+    elif a.action == "stress":
+        cmd_stress(
+            cfg,
+            iterations=a.iterations,
+            mode=a.stress_mode,
+            timeout=a.timeout,
+            target=a.leak_target,
+            out_dir=a.out_dir,
+            json_output=a.json_output,
+            verify_after_rotation=not a.no_verify,
+        )
 
 
 if __name__ == "__main__":

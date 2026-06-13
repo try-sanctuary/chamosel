@@ -219,10 +219,169 @@ class ControllerTests(unittest.TestCase):
             'chamosel_rotation_errors_by_outcome_total{outcome="recovery_timeout"} 1',
             metrics,
         )
-        self.assertIn(
-            'chamosel_instance_rotation_errors_by_outcome_total{instance="vpn_1",outcome="recovery_timeout"} 1',
-            metrics,
+
+    def test_new_rotation_state_defaults_and_persistence(self):
+        snap = self.ctrl.STATE.snapshot()
+        state = snap["instances"][0]
+
+        self.assertEqual(0.0, state["last_rotation_attempted"])
+        self.assertIsNone(state["last_rotation_message"])
+        self.assertIsNone(state["last_rotation_old_ip"])
+        self.assertIsNone(state["last_rotation_new_ip"])
+        self.assertEqual(0.0, state["cooldown_until"])
+        self.assertEqual(0.0, state["cooldown_remaining_seconds"])
+        self.assertIsNone(state["cooldown_reason"])
+        self.assertEqual(0, state["forced_bypass_count"])
+
+        self.ctrl.STATE.start_cooldown("vpn_0", self.ctrl.OUTCOME_RECOVERY_TIMEOUT)
+        self.ctrl.STATE.record_rotation(
+            "vpn_0",
+            self.ctrl.OUTCOME_RECOVERY_TIMEOUT,
+            message="safe message",
+            old_ip="1.1.1.1",
+            new_ip=None,
         )
+
+        reloaded = self.ctrl.State()
+        persisted = reloaded.snapshot()["instances"][0]
+        self.assertEqual(self.ctrl.OUTCOME_RECOVERY_TIMEOUT, persisted["last_rotation_outcome"])
+        self.assertEqual("safe message", persisted["last_rotation_message"])
+        self.assertEqual("1.1.1.1", persisted["last_rotation_old_ip"])
+        self.assertGreater(persisted["cooldown_until"], time.time())
+        self.assertEqual(self.ctrl.OUTCOME_RECOVERY_TIMEOUT, persisted["cooldown_reason"])
+
+    def test_recovery_timeout_starts_cooldown(self):
+        def fake_ctrl(method, instance, path, body=None):
+            if method == "GET" and path in self.ctrl.STATUS_PATHS:
+                return {"status": "running"}
+            if method == "PUT":
+                return {}
+            raise AssertionError((method, path))
+
+        self.ctrl._ctrl = fake_ctrl
+        self.ctrl.is_healthy = lambda instance: False
+        self.ctrl.sleep = lambda seconds: None
+
+        result = self.ctrl.rotate_instance("vpn_0", force=True)
+        state = self.ctrl.STATE.snapshot()["instances"][0]
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(self.ctrl.OUTCOME_RECOVERY_TIMEOUT, result["outcome"])
+        self.assertGreater(state["cooldown_remaining_seconds"], 0)
+        self.assertEqual(self.ctrl.OUTCOME_RECOVERY_TIMEOUT, state["cooldown_reason"])
+
+    def test_rotate_all_skips_cooling_backends_and_rotates_eligible(self):
+        calls = []
+
+        def fake_rotate(instance, force=False):
+            calls.append((instance, force))
+            if self.ctrl.STATE.cooldown_remaining(instance) > 0:
+                return self.ctrl.rotation_response(
+                    instance,
+                    False,
+                    self.ctrl.OUTCOME_COOLDOWN,
+                    time.monotonic(),
+                    cooldown_remaining_seconds=round(self.ctrl.STATE.cooldown_remaining(instance), 3),
+                )
+            return self.ctrl.rotation_response(instance, True, self.ctrl.OUTCOME_SUCCESS, time.monotonic())
+
+        self.ctrl.STATE.start_cooldown("vpn_0", self.ctrl.OUTCOME_RECOVERY_TIMEOUT)
+        self.ctrl.rotate_instance = fake_rotate
+
+        result = self.ctrl.rotate_all()
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(self.ctrl.AGG_OUTCOME_PARTIAL_SUCCESS, result["outcome"])
+        self.assertEqual(1, result["eligible_count"])
+        self.assertEqual(1, result["skipped_count"])
+        self.assertEqual(1, result["success_count"])
+        self.assertEqual(1, result["cooldown_count"])
+        self.assertEqual([("vpn_1", False)], calls)
+        self.assertEqual(self.ctrl.OUTCOME_COOLDOWN, result["results"][0]["outcome"])
+
+    def test_named_force_bypasses_cooldown_and_reports_bypass(self):
+        def fake_ctrl(method, instance, path, body=None):
+            if method == "GET" and path in self.ctrl.STATUS_PATHS:
+                return {"status": "running"}
+            if method == "PUT":
+                return {}
+            raise AssertionError((method, path))
+
+        self.ctrl._ctrl = fake_ctrl
+        self.ctrl.STATE.start_cooldown("vpn_0", self.ctrl.OUTCOME_RECOVERY_TIMEOUT)
+        self.ctrl.STATE.update_health("vpn_0", True, "1.1.1.1", status=self.ctrl.STATUS_HEALTHY)
+        self.ctrl.is_healthy = lambda instance: True
+        self.ctrl.get_public_ip = lambda instance: "2.2.2.2"
+        self.ctrl.sleep = lambda seconds: None
+
+        result = self.ctrl.rotate_instance("vpn_0", force=True)
+        state = self.ctrl.STATE.snapshot()["instances"][0]
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["forced_bypass"])
+        self.assertEqual(1, state["forced_bypass_count"])
+
+    def test_healthy_ip_unchanged_outcome_is_degraded_not_success(self):
+        def fake_ctrl(method, instance, path, body=None):
+            if method == "GET" and path in self.ctrl.STATUS_PATHS:
+                return {"status": "running"}
+            if method == "PUT":
+                return {}
+            raise AssertionError((method, path))
+
+        self.ctrl._ctrl = fake_ctrl
+        self.ctrl.STATE.update_health("vpn_0", True, "1.1.1.1", status=self.ctrl.STATUS_HEALTHY)
+        self.ctrl.is_healthy = lambda instance: True
+        self.ctrl.get_public_ip = lambda instance: "1.1.1.1"
+        self.ctrl.sleep = lambda seconds: None
+
+        result = self.ctrl.rotate_instance("vpn_0", force=True)
+        snap = self.ctrl.STATE.snapshot()
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(self.ctrl.OUTCOME_HEALTHY_IP_UNCHANGED, result["outcome"])
+        self.assertEqual(0, snap["rotations_total"])
+        self.assertEqual(1, snap["rotation_errors_by_outcome"][self.ctrl.OUTCOME_HEALTHY_IP_UNCHANGED])
+
+    def test_proxy_failure_outcome_when_recovered_proxy_probe_fails(self):
+        def fake_ctrl(method, instance, path, body=None):
+            if method == "GET" and path in self.ctrl.STATUS_PATHS:
+                return {"status": "running"}
+            if method == "PUT":
+                return {}
+            raise AssertionError((method, path))
+
+        self.ctrl._ctrl = fake_ctrl
+        self.ctrl.STATE.update_health("vpn_0", True, "1.1.1.1", status=self.ctrl.STATUS_HEALTHY)
+        self.ctrl.is_healthy = lambda instance: True
+        self.ctrl.get_public_ip = lambda instance: "2.2.2.2"
+        self.ctrl.verify_proxy_after_rotation = lambda instance: (False, "proxy refused")
+        self.ctrl.sleep = lambda seconds: None
+
+        result = self.ctrl.rotate_instance("vpn_0", force=True)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(self.ctrl.OUTCOME_PROXY_FAILURE, result["outcome"])
+        self.assertIn("proxy refused", result["message"])
+
+    def test_metrics_expose_latest_outcome_and_cooldown(self):
+        self.ctrl.STATE.start_cooldown("vpn_0", self.ctrl.OUTCOME_RECOVERY_TIMEOUT)
+        self.ctrl.STATE.record_rotation("vpn_0", self.ctrl.OUTCOME_RECOVERY_TIMEOUT)
+
+        metrics = self.ctrl.render_metrics()
+
+        self.assertIn('chamosel_instance_rotation_outcome{instance="vpn_0",outcome="recovery_timeout"} 1', metrics)
+        self.assertIn('chamosel_instance_rotation_cooldown_active{instance="vpn_0"} 1', metrics)
+        self.assertIn('chamosel_instance_rotation_cooldown_remaining_seconds{instance="vpn_0"}', metrics)
+
+    def test_dashboard_exposes_latest_outcome_and_cooldown(self):
+        self.ctrl.STATE.start_cooldown("vpn_0", self.ctrl.OUTCOME_RECOVERY_TIMEOUT)
+        self.ctrl.STATE.record_rotation("vpn_0", self.ctrl.OUTCOME_RECOVERY_TIMEOUT)
+
+        html = self.ctrl.render_dashboard()
+
+        self.assertIn("recovery_timeout", html)
+        self.assertIn("cooldown", html)
 
 
 if __name__ == "__main__":
