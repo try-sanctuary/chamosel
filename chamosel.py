@@ -23,6 +23,7 @@ Usage:
 
 import argparse
 from dataclasses import dataclass
+import ipaddress
 import json
 import logging
 import os
@@ -39,6 +40,8 @@ CONFIG_FILE = "config.yml"
 COMPOSE_FILE = "docker-compose.yml"
 HAPROXY_FILE = "haproxy.cfg"
 ENV_FILE = ".env"
+DEFAULT_LEAK_TARGET = "https://ifconfig.co/json"
+DEFAULT_LEAK_TIMEOUT = 30
 
 # In-container ports (fixed)
 GLUETUN_PROXY_PORT = 8888
@@ -240,6 +243,10 @@ def compose_cmd(args: list, capture=False):
         log.error("compose %s failed: %s", " ".join(args), e.stderr or e.stdout); sys.exit(1)
 
 
+class LeakVerificationError(Exception):
+    """Operator-safe verification failure."""
+
+
 def api_call(cfg: dict, method: str, path: str):
     url = f"http://localhost:{gset(cfg, 'api_port')}{path}"
     req = urllib.request.Request(url, method=method)
@@ -247,6 +254,246 @@ def api_call(cfg: dict, method: str, path: str):
         return json.load(urllib.request.urlopen(req, timeout=15))
     except Exception as e:
         log.error("controller call %s %s failed: %s", method, path, e); sys.exit(1)
+
+
+def is_public_ip(value: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(str(value).strip())
+    except ValueError:
+        return False
+    return ip.is_global
+
+
+def extract_public_ip(payload: dict) -> str:
+    if not isinstance(payload, dict):
+        raise LeakVerificationError("response is not a JSON object")
+    for key in ("ip", "query", "public_ip"):
+        value = payload.get(key)
+        if value and is_public_ip(str(value)):
+            return str(value).strip()
+    raise LeakVerificationError("response does not contain a public IP")
+
+
+def validate_timeout(timeout) -> int:
+    try:
+        value = int(timeout)
+    except (TypeError, ValueError):
+        raise LeakVerificationError("timeout must be a positive integer")
+    if value <= 0:
+        raise LeakVerificationError("timeout must be a positive integer")
+    return value
+
+
+def validate_target(target: str) -> str:
+    target = (target or "").strip()
+    if not target.startswith(("http://", "https://")):
+        raise LeakVerificationError("target must start with http:// or https://")
+    return target
+
+
+def fetch_json_url(url: str, timeout: int) -> dict:
+    req = urllib.request.Request(
+        url,
+        headers={
+            "accept": "application/json",
+            "user-agent": "chamosel leak verifier",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.load(resp)
+
+
+def fetch_direct_ip(target: str, timeout: int) -> tuple[str, dict]:
+    payload = fetch_json_url(target, timeout)
+    return extract_public_ip(payload), payload
+
+
+def fetch_pool_state(cfg: dict) -> dict:
+    url = f"http://localhost:{gset(cfg, 'api_port')}/pool?fresh=1"
+    req = urllib.request.Request(url, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.load(resp)
+    except Exception as e:
+        raise LeakVerificationError(f"controller unreachable or returned invalid pool state: {e}")
+    if not isinstance(data, dict) or not isinstance(data.get("instances"), list):
+        raise LeakVerificationError("controller returned malformed pool state")
+    return data
+
+
+PROBE_SCRIPT = r"""
+import json
+import sys
+import urllib.request
+
+target, proxy, timeout = sys.argv[1], sys.argv[2], int(sys.argv[3])
+opener = urllib.request.build_opener(
+    urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+)
+req = urllib.request.Request(
+    target,
+    headers={"accept": "application/json", "user-agent": "chamosel leak verifier"},
+)
+try:
+    with opener.open(req, timeout=timeout) as resp:
+        payload = json.load(resp)
+    print(json.dumps({"ok": True, "payload": payload}, separators=(",", ":")))
+except Exception as exc:
+    print(json.dumps({"ok": False, "error": str(exc)}, separators=(",", ":")))
+    sys.exit(1)
+""".strip()
+
+
+def build_backend_probe_cmd(instance: str, target: str, timeout: int) -> list[str]:
+    proxy = f"http://{instance}:{GLUETUN_PROXY_PORT}"
+    return [
+        "docker",
+        "compose",
+        "-f",
+        COMPOSE_FILE,
+        "exec",
+        "-T",
+        "controller",
+        "python",
+        "-c",
+        PROBE_SCRIPT,
+        target,
+        proxy,
+        str(timeout),
+    ]
+
+
+def run_backend_probe(instance: str, target: str, timeout: int) -> dict:
+    cmd = build_backend_probe_cmd(instance, target, timeout)
+    try:
+        result = subprocess.run(cmd, text=True, capture_output=True, check=False, timeout=timeout + 5)
+    except FileNotFoundError:
+        raise LeakVerificationError("docker not found")
+    except subprocess.TimeoutExpired:
+        raise LeakVerificationError("backend probe timed out")
+
+    stdout = (result.stdout or "").strip()
+    if not stdout:
+        raise LeakVerificationError("backend probe returned no output")
+    try:
+        data = json.loads(stdout)
+    except json.JSONDecodeError:
+        raise LeakVerificationError("backend probe returned malformed JSON")
+    if result.returncode != 0 or not data.get("ok"):
+        raise LeakVerificationError(data.get("error") or "backend probe failed")
+    return data.get("payload") or {}
+
+
+def normalize_probe_result(instance: dict, direct_ip: str, payload: dict, error: str | None = None) -> dict:
+    proxy_ip = None
+    proxy_ok = False
+    leak_detected = False
+    result_error = error
+
+    if error is None:
+        try:
+            proxy_ip = extract_public_ip(payload)
+            proxy_ok = True
+            leak_detected = proxy_ip == direct_ip
+            if leak_detected:
+                result_error = "proxy IP equals direct host IP"
+        except LeakVerificationError as e:
+            result_error = str(e)
+
+    metadata = payload if isinstance(payload, dict) else {}
+    return {
+        "name": instance.get("name") or "",
+        "controller_status": instance.get("status") or ("healthy" if instance.get("healthy") else "down"),
+        "controller_public_ip": instance.get("public_ip"),
+        "proxy_ok": proxy_ok and not leak_detected and result_error is None,
+        "proxy_ip": proxy_ip,
+        "country": metadata.get("country"),
+        "region": metadata.get("region"),
+        "city": metadata.get("city"),
+        "asn": metadata.get("asn"),
+        "asn_org": metadata.get("asn_org") or metadata.get("asn_org_name"),
+        "leak_detected": leak_detected,
+        "error": result_error,
+    }
+
+
+def verify_leaks(cfg: dict, target: str = DEFAULT_LEAK_TARGET, timeout: int = DEFAULT_LEAK_TIMEOUT) -> dict:
+    try:
+        target = validate_target(target)
+        timeout = validate_timeout(timeout)
+        direct_ip, _ = fetch_direct_ip(target, timeout)
+        pool = fetch_pool_state(cfg)
+    except LeakVerificationError as e:
+        return {
+            "direct_ip": None,
+            "target": target,
+            "ok": False,
+            "verified_count": 0,
+            "total_count": 0,
+            "error": str(e),
+            "instances": [],
+        }
+    except Exception as e:
+        return {
+            "direct_ip": None,
+            "target": target,
+            "ok": False,
+            "verified_count": 0,
+            "total_count": 0,
+            "error": f"verification failed: {e}",
+            "instances": [],
+        }
+
+    results = []
+    for instance in pool.get("instances", []):
+        healthy = bool(instance.get("healthy"))
+        status = instance.get("status") or ("healthy" if healthy else "down")
+        if not healthy:
+            results.append(normalize_probe_result(instance, direct_ip, {}, f"controller status is {status}"))
+            continue
+        try:
+            payload = run_backend_probe(instance.get("name") or "", target, timeout)
+            results.append(normalize_probe_result(instance, direct_ip, payload))
+        except LeakVerificationError as e:
+            results.append(normalize_probe_result(instance, direct_ip, {}, str(e)))
+
+    verified_count = sum(1 for item in results if item["proxy_ok"] and not item["leak_detected"] and item["error"] is None)
+    total_count = len(results)
+    ok = total_count > 0 and verified_count == total_count
+    return {
+        "direct_ip": direct_ip,
+        "target": target,
+        "ok": ok,
+        "verified_count": verified_count,
+        "total_count": total_count,
+        "error": None if ok else "one or more backends failed leak verification",
+        "instances": results,
+    }
+
+
+def render_leak_table(result: dict) -> str:
+    lines = [f"Direct host IP: {result.get('direct_ip') or '-'}", ""]
+    lines.append(
+        f"{'INSTANCE':<28} {'STATUS':<20} {'CONTROLLER_IP':<16} "
+        f"{'PROXY_IP':<16} {'COUNTRY':<16} {'ASN':<12} RESULT"
+    )
+    for item in result.get("instances", []):
+        reason = "ok" if item.get("proxy_ok") and not item.get("error") else (item.get("error") or "failed")
+        lines.append(
+            f"{item.get('name') or '-':<28} "
+            f"{item.get('controller_status') or '-':<20} "
+            f"{item.get('controller_public_ip') or '-':<16} "
+            f"{item.get('proxy_ip') or '-':<16} "
+            f"{item.get('country') or '-':<16} "
+            f"{item.get('asn') or '-':<12} "
+            f"{reason}"
+        )
+    if result.get("error") and not result.get("instances"):
+        lines.append(result["error"])
+    lines.append("")
+    lines.append(f"Verified: {result.get('verified_count', 0)}/{result.get('total_count', 0)} backends")
+    lines.append(f"Leak result: {'PASS' if result.get('ok') else 'FAIL'}")
+    return "\n".join(lines)
 
 
 def cmd_up(cfg, pull_images: bool = True):
@@ -278,13 +525,34 @@ def cmd_rotate(cfg, target):
     print(json.dumps(api_call(cfg, "POST", path), indent=2))
 
 
-def main():
+def cmd_verify_leaks(cfg, json_output: bool = False, timeout: int = DEFAULT_LEAK_TIMEOUT, target: str = DEFAULT_LEAK_TARGET):
+    result = verify_leaks(cfg, target=target, timeout=timeout)
+    if json_output:
+        print(json.dumps(result, indent=2))
+    else:
+        print(render_leak_table(result))
+    if not result.get("ok"):
+        raise SystemExit(1)
+
+
+def build_parser():
     p = argparse.ArgumentParser(description="chamosel - spin the wheel, change the skin")
-    p.add_argument("action", choices=["genkey", "generate", "up", "down", "status", "rotate"])
-    p.add_argument("target", nargs="?", help="for rotate: instance name or 'all'")
+    p.add_argument("action", choices=["genkey", "generate", "up", "down", "status", "rotate", "verify-leaks"])
+    p.add_argument("rotate_target", nargs="?", help="for rotate: instance name or 'all'")
     p.add_argument("-c", "--config", default=CONFIG_FILE)
     p.add_argument("--no-pull", action="store_true",
                    help="for up: skip docker compose pull and use local images")
+    p.add_argument("--json", dest="json_output", action="store_true",
+                   help="for verify-leaks: output one JSON object")
+    p.add_argument("--timeout", type=int, default=DEFAULT_LEAK_TIMEOUT,
+                   help=f"for verify-leaks: request timeout in seconds (default: {DEFAULT_LEAK_TIMEOUT})")
+    p.add_argument("--target", dest="leak_target", default=DEFAULT_LEAK_TARGET,
+                   help=f"for verify-leaks: public-IP JSON target (default: {DEFAULT_LEAK_TARGET})")
+    return p
+
+
+def main():
+    p = build_parser()
     a = p.parse_args()
     if a.action == "genkey":
         print(gen_api_key()); return
@@ -293,7 +561,8 @@ def main():
     elif a.action == "up": cmd_up(cfg, pull_images=not a.no_pull)
     elif a.action == "down": compose_cmd(["down"])
     elif a.action == "status": cmd_status(cfg)
-    elif a.action == "rotate": cmd_rotate(cfg, a.target)
+    elif a.action == "rotate": cmd_rotate(cfg, a.rotate_target)
+    elif a.action == "verify-leaks": cmd_verify_leaks(cfg, a.json_output, a.timeout, a.leak_target)
 
 
 if __name__ == "__main__":
