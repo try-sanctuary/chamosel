@@ -64,6 +64,10 @@ services:
       POOL_DEGRADED_MIN_HEALTHY: "{{ pool_degraded_min_healthy }}"
       AUTO_REPAIR_DUPLICATE_IPS: "{{ auto_repair_duplicate_ips }}"
       DUPLICATE_REPAIR_RETRY_COOLDOWN: "{{ duplicate_repair_retry_cooldown }}"
+      EGRESS_VERIFY_TARGET: {{ egress_verify_target | tojson }}
+      EGRESS_VERIFY_TIMEOUT: "{{ egress_verify_timeout }}"
+      EGRESS_VERIFY_TTL: "{{ egress_verify_ttl }}"
+      EGRESS_VERIFY_ON_FRESH: "{{ egress_verify_on_fresh }}"
       POLL_INTERVAL: "{{ poll_interval }}"
       STATE_FILE: "/data/state.json"
     volumes:

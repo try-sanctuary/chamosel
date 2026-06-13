@@ -64,7 +64,7 @@ python3 chamosel.py doctor
 python3 chamosel.py doctor --json
 ```
 
-It checks Docker Compose visibility, controller `/health`, a fresh `/pool?fresh=1`, HAProxy stats port reachability, healthy backend count, image freshness mode, and whether `.env.local` exists. It reports paths and booleans only, not secret values. When the pool is degraded, `doctor` also reports a `repair_decision`: for duplicate public IPs this reflects the controller repair action triggered by the fresh pool check, an in-flight repair, or retry backoff.
+It checks Docker Compose visibility, controller `/health`, a fresh `/pool?fresh=1`, HAProxy stats port reachability, healthy backend count, image freshness mode, and whether `.env.local` exists. It reports paths and booleans only, not secret values. A fresh pool check also refreshes verified backend proxy exit IPs when their cache is expired. When the pool is degraded, `doctor` reports a `repair_decision`: duplicate verified proxy IPs can trigger controller repair, public-IP mismatch is monitored without rotation, and failed egress verification requires manual inspection.
 
 ## Leak Verification
 
@@ -85,7 +85,7 @@ The check verifies that:
 
 - the direct host IP differs from every checked backend proxy exit IP
 - each healthy backend can reach the target through its own VPN proxy path
-- controller health and backend verification agree well enough to report PASS
+- controller public IP, controller verified proxy IP, and live proxy verification are reported side by side
 
 The check fails closed when the controller is unreachable, the host IP cannot be determined, a backend is unhealthy, a backend cannot proxy the target, a backend returns no public IP, or a backend returns the same IP as the host.
 
@@ -118,7 +118,7 @@ Use the three validation commands for different jobs:
 - `verify-leaks`: one end-to-end proxy leak check for each healthy backend.
 - `stress`: repeated validation, optionally with cautious rotation.
 
-For Surfshark-style live testing, start conservatively with `num_containers: 5`, `rotate_cooldown: 60`, and `rotation_recovery_timeout: 60` to `90`. Larger pools can work, but frequent mass rotation may hit provider recovery limits. `rotate/all` skips backends in cooldown, rotates eligible backends in small batches, and continues when one backend times out. Duplicate public IPs are treated as degraded; after a fresh health check the controller schedules one background repair rotation for a duplicate backend when it is not in cooldown. If repair fails, `duplicate_repair_retry_cooldown` prevents immediate retry loops.
+For Surfshark-style live testing, start conservatively with `num_containers: 5`, `rotate_cooldown: 60`, and `rotation_recovery_timeout: 60` to `90`. Larger pools can work, but frequent mass rotation may hit provider recovery limits. `rotate/all` skips backends in cooldown, rotates eligible backends in small batches, and continues when one backend times out. Duplicate verified proxy IPs are treated as degraded; after a fresh health check the controller schedules one background repair rotation for a duplicate backend when it is not in cooldown. If repair fails, `duplicate_repair_retry_cooldown` prevents immediate retry loops. If gluetun's control API public IP differs from the verified proxy exit IP, chamosel marks the pool degraded for visibility but does not rotate unless the verified proxy IP is duplicated.
 
 ## REST API (controller, port 8800)
 
@@ -126,8 +126,8 @@ For Surfshark-style live testing, start conservatively with `num_containers: 5`,
 |---|---|---|
 | GET | `/` | HTML dashboard (auto-refresh 5s) |
 | GET | `/health` | Liveness |
-| GET | `/pool` | Per-instance health + public IP (cached snapshot) |
-| GET | `/pool?fresh=1` | Force a live refresh first |
+| GET | `/pool` | Per-instance health, gluetun public IP, verified proxy IP, and pool state (cached snapshot) |
+| GET | `/pool?fresh=1` | Force a live refresh first; refreshes verified proxy IPs when their TTL expired |
 | GET | `/metrics` | Prometheus exposition format |
 | POST | `/rotate` | Rotate one random eligible instance (respects cooldown) |
 | POST | `/rotate/<name>` | Rotate a named instance (forced) |
@@ -157,6 +157,8 @@ chamosel_instance_rotation_errors_by_outcome_total{instance="...",outcome="..."}
 chamosel_instance_rotation_outcome{instance="...",outcome="..."}
 chamosel_instance_rotation_cooldown_active{instance="..."}
 chamosel_instance_rotation_cooldown_remaining_seconds{instance="..."}
+chamosel_instance_egress_state_fresh{instance="..."}
+chamosel_instance_public_ip_mismatch{instance="..."}
 ```
 
 ## Config (`config.yml`)
@@ -179,6 +181,10 @@ global_settings:
   pool_degraded_min_healthy: auto
   auto_repair_duplicate_ips: true
   duplicate_repair_retry_cooldown: 300
+  egress_verify_target: https://ifconfig.co/json
+  egress_verify_timeout: 10
+  egress_verify_ttl: 120
+  egress_verify_on_fresh: true
   poll_interval: 15          # background health/IP poll interval
   # api_key: ""              # optional local gluetun control-server key
 
@@ -207,7 +213,8 @@ $res = $client->fetchWithRetry('https://example.com/products');
 
 - **Per-request IP rotation:** with `mode tcp`, one keep-alive connection pins one exit IP. Set `CURLOPT_FRESH_CONNECT` in PHP (already done in the example) or use `balance leastconn`.
 - **After rotation:** the controller waits up to `rotation_recovery_timeout` seconds for a healthy tunnel and changed public IP. If recovery times out, `/rotate` returns `ok: false` with outcome `recovery_timeout` and starts a cooldown for mass/automatic rotation. If the tunnel is healthy but the IP did not change, the outcome is `healthy_ip_unchanged`.
-- **Pool status:** `/pool`, `/metrics`, `status`, and the dashboard expose `pool_status` as `healthy`, `degraded`, or `down`. The pool is degraded when state is stale after controller restart, too few backends are healthy, duplicate public IPs are detected, or recent rotation recovery/proxy checks failed. With `auto_repair_duplicate_ips: true`, duplicate-IP detection after polling or `/pool?fresh=1` schedules one non-forced background rotation for a duplicate backend, respecting cooldown and `duplicate_repair_retry_cooldown`.
+- **Verified egress IP:** `/pool?fresh=1` verifies each healthy backend by requesting `egress_verify_target` through that backend's HTTP proxy and caches the resulting `verified_proxy_ip` for `egress_verify_ttl` seconds. Diversity checks prefer fresh verified proxy IPs over gluetun's `/v1/publicip/ip` value. A `public_ip_mismatch` is visible degraded state, but not an automatic repair trigger by itself.
+- **Pool status:** `/pool`, `/metrics`, `status`, and the dashboard expose `pool_status` as `healthy`, `degraded`, or `down`. The pool is degraded when state is stale after controller restart, too few backends are healthy, duplicate verified proxy IPs or fallback public IPs are detected, egress verification fails, public IP differs from verified proxy IP, or recent rotation recovery/proxy checks failed. With `auto_repair_duplicate_ips: true`, duplicate-IP detection after polling or `/pool?fresh=1` schedules one non-forced background rotation for a duplicate backend, respecting cooldown and `duplicate_repair_retry_cooldown`.
 - **Mass rotation:** `/rotate/all` rotates eligible backends in batches. The defaults are `rotate_all_batch_size: 2` and `rotate_all_batch_delay_seconds: 2`; keep `rotate_cooldown > 0` for live providers so repeated recovery failures back off instead of hammering the same account.
 - **Control API key:** `api_key` is not a paid gluetun key and not a provider subscription key. It is a local secret shared between gluetun's control server and the chamosel controller. If you set it in `config.yml`, `generate` writes the same value to `.env` so Docker Compose can pass it to the controller. If `.env` and `config.yml` disagree, generation fails instead of creating a split-brain auth setup.
 - **Provider secrets:** keep VPN credentials out of `config.yml` when possible. Copy `.env.example` to `.env.local`, set `global_settings.env_file: .env.local`, and put values such as `WIREGUARD_PRIVATE_KEY` there. `.env.local` is ignored by Git.
