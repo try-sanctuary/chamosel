@@ -22,8 +22,8 @@ scraper ──http_proxy──> HAProxy :8888 ──tcp──> gluetun_0 ── 
 - **Local control surfaces by default** — controller/dashboard and HAProxy stats bind to `127.0.0.1` on the host unless you explicitly change the bind addresses.
 - **API-version aware** — detects `/v1/vpn/status` (v3.41+) vs legacy `/v1/openvpn/status` per instance, cached after first success.
 - **Health-aware pool** — HAProxy probes gluetun's health server (`:9999`), not the proxy port. A gluetun with a dead VPN still answers on the proxy port; chamosel evicts it properly.
-- **Observable** — Prometheus `/metrics`, auto-refreshing dashboard at `/`, per-instance IP history persisted across controller restarts.
-- **Cooldown** — prevents hammering the same instance; forced override on `/rotate/<name>` and `/rotate/all`.
+- **Observable** — Prometheus `/metrics`, auto-refreshing dashboard at `/`, per-instance IP history, latest rotation outcome, and cooldown state persisted across controller restarts.
+- **Cooldown** — prevents hammering the same instance after recent rotation or recovery failures; forced override is explicit on `/rotate/<name>`.
 - **Mixed providers** — Surfshark, ProtonVPN, Mullvad, etc. in the same pool.
 
 ## Quick start
@@ -52,6 +52,7 @@ curl -x http://localhost:8888 https://ipinfo.io/ip
 | `chamosel.py status` | Health + public IP + rotation count per instance |
 | `chamosel.py rotate [name\|all]` | Ask the controller to rotate |
 | `chamosel.py verify-leaks` | Verify backend proxy exit IPs do not expose the host IP |
+| `chamosel.py stress` | Repeat leak-only or rotation stress validation |
 
 ## Leak Verification
 
@@ -83,6 +84,24 @@ What it does not guarantee:
 - SOCKS clients using local DNS. Use remote DNS behavior such as `socks5h://` when a SOCKS client is involved.
 - Traffic that bypasses chamosel entirely.
 
+## Stress Validation
+
+Leak-only stress repeats leak verification without rotating tunnels:
+
+```bash
+python3 chamosel.py stress --iterations 100 --mode leak-only
+```
+
+Rotation stress exercises `POST /rotate/all` and summarizes partial success, cooldown skips, and per-backend outcomes:
+
+```bash
+python3 chamosel.py stress --iterations 10 --mode rotation
+```
+
+Use `--out-dir ./stress-results` to write `summary.json`. Rotation stress verifies leaks after each rotation by default; add `--no-verify` when you only want to exercise controller rotation behavior.
+
+For Surfshark-style live testing, start conservatively with `num_containers: 5`. Larger pools can work, but frequent mass rotation may hit provider recovery limits. `rotate/all` now skips backends in cooldown and continues with eligible backends instead of repeatedly retrying the same failing tunnel.
+
 ## REST API (controller, port 8800)
 
 | Method | Path | Description |
@@ -94,7 +113,7 @@ What it does not guarantee:
 | GET | `/metrics` | Prometheus exposition format |
 | POST | `/rotate` | Rotate one random eligible instance (respects cooldown) |
 | POST | `/rotate/<name>` | Rotate a named instance (forced) |
-| POST | `/rotate/all` | Rotate every instance sequentially (forced) |
+| POST | `/rotate/all` | Rotate every eligible instance sequentially and summarize partial results |
 
 ```bash
 curl localhost:8800/pool | jq
@@ -114,6 +133,9 @@ chamosel_instance_healthy{instance="..."}
 chamosel_instance_status{instance="...",status="..."}
 chamosel_instance_rotations_total{instance="..."}
 chamosel_instance_rotation_errors_by_outcome_total{instance="...",outcome="..."}
+chamosel_instance_rotation_outcome{instance="...",outcome="..."}
+chamosel_instance_rotation_cooldown_active{instance="..."}
+chamosel_instance_rotation_cooldown_remaining_seconds{instance="..."}
 ```
 
 ## Config (`config.yml`)
@@ -136,7 +158,7 @@ global_settings:
 
 vpn_providers:
   surfshark:
-    num_containers: 4
+    num_containers: 5
     env:
       VPN_TYPE: wireguard
       WIREGUARD_PRIVATE_KEY: "[YOUR_KEY]"
@@ -158,11 +180,11 @@ $res = $client->fetchWithRetry('https://example.com/products');
 ## Notes
 
 - **Per-request IP rotation:** with `mode tcp`, one keep-alive connection pins one exit IP. Set `CURLOPT_FRESH_CONNECT` in PHP (already done in the example) or use `balance leastconn`.
-- **After rotation:** the controller waits up to `rotation_recovery_timeout` seconds for a healthy tunnel and changed public IP. If recovery times out, `/rotate` returns `ok: false` with outcome `recovery_timeout`.
+- **After rotation:** the controller waits up to `rotation_recovery_timeout` seconds for a healthy tunnel and changed public IP. If recovery times out, `/rotate` returns `ok: false` with outcome `recovery_timeout` and starts a cooldown for mass/automatic rotation. If the tunnel is healthy but the IP did not change, the outcome is `healthy_ip_unchanged`.
 - **Control API key:** `api_key` is not a paid gluetun key and not a provider subscription key. It is a local secret shared between gluetun's control server and the chamosel controller. If you set it in `config.yml`, `generate` writes the same value to `.env` so Docker Compose can pass it to the controller. If `.env` and `config.yml` disagree, generation fails instead of creating a split-brain auth setup.
 - **Provider secrets:** keep VPN credentials out of `config.yml` when possible. Copy `.env.example` to `.env.local`, set `global_settings.env_file: .env.local`, and put values such as `WIREGUARD_PRIVATE_KEY` there. `.env.local` is ignored by Git.
 - **Image freshness:** `chamosel.py up` runs `docker compose pull --ignore-buildable` before starting the stack so runtime images such as gluetun do not silently stay stale. Use `chamosel.py up --no-pull` when you intentionally want to use only local cached images.
-- **Surfshark:** caps simultaneous connections per plan. Size `num_containers` accordingly.
+- **Surfshark:** start live validation around `num_containers: 5` and increase carefully. Frequent `rotate/all` can run into provider recovery delays even when leak-only verification is stable.
 - **API/dashboard exposure:** ports `8800` and `8404` bind to localhost by default. If you set `api_bind` or `stats_bind` to `0.0.0.0`, put them behind firewall/reverse-proxy auth.
 - **Docker volumes:** `chamosel.py down` preserves volumes (gluetun servers cache + state). Use `docker compose down -v` to wipe everything.
 

@@ -223,11 +223,154 @@ class VerifyLeakTests(unittest.TestCase):
         help_text = parser.format_help()
 
         self.assertIn("verify-leaks", help_text)
+        self.assertIn("stress", help_text)
         self.assertIn("--json", help_text)
         self.assertIn("--timeout", help_text)
         self.assertIn("--target", help_text)
+        self.assertIn("--iterations", help_text)
+        self.assertIn("--mode", help_text)
         self.assertNotIn("GLUETUN_API_KEY", help_text)
         self.assertNotIn("WIREGUARD_PRIVATE_KEY", help_text)
+
+    def test_status_output_contains_latest_outcome_and_cooldown(self):
+        self.chamosel.api_call = lambda cfg, method, path: {
+            "healthy": 1,
+            "count": 1,
+            "rotations_total": 0,
+            "instances": [
+                {
+                    "name": "surfshark_0",
+                    "status": "healthy",
+                    "healthy": True,
+                    "rotations": 0,
+                    "public_ip": "45.134.140.5",
+                    "last_rotation_outcome": "recovery_timeout",
+                    "cooldown_remaining_seconds": 42,
+                    "cooldown_reason": "recovery_timeout",
+                }
+            ],
+        }
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.chamosel.cmd_status(self.cfg)
+
+        rendered = buf.getvalue()
+        self.assertIn("OUTCOME", rendered)
+        self.assertIn("COOLDOWN", rendered)
+        self.assertIn("recovery_timeout", rendered)
+        self.assertIn("42s", rendered)
+
+    def test_stress_parser_accepts_expected_options(self):
+        args = self.chamosel.build_parser().parse_args(
+            [
+                "stress",
+                "--iterations",
+                "100",
+                "--mode",
+                "rotation",
+                "--target",
+                "https://ifconfig.co/json",
+                "--timeout",
+                "12",
+                "--out-dir",
+                "/tmp/chamosel-stress",
+            ]
+        )
+
+        self.assertEqual("stress", args.action)
+        self.assertEqual(100, args.iterations)
+        self.assertEqual("rotation", args.stress_mode)
+        self.assertEqual(12, args.timeout)
+        self.assertEqual("/tmp/chamosel-stress", args.out_dir)
+
+    def test_leak_only_stress_does_not_rotate_and_summarizes_report(self):
+        rotate_calls = []
+        verify_calls = []
+
+        def fake_verify(cfg, target, timeout):
+            verify_calls.append((target, timeout))
+            return {
+                "ok": True,
+                "verified_count": 1,
+                "total_count": 1,
+                "instances": [
+                    {
+                        "name": "surfshark_0",
+                        "proxy_ip": "45.134.140.5",
+                        "leak_detected": False,
+                        "error": None,
+                    }
+                ],
+            }
+
+        self.chamosel.verify_leaks = fake_verify
+        self.chamosel.api_call = lambda cfg, method, path, timeout=15: rotate_calls.append(path) or {}
+
+        result = self.chamosel.run_stress(
+            self.cfg,
+            iterations=3,
+            mode="leak-only",
+            target="https://ifconfig.co/json",
+            timeout=7,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual("leak_only", result["mode"])
+        self.assertEqual(3, result["iterations_completed"])
+        self.assertEqual(3, result["verified_backend_checks"])
+        self.assertEqual(0, result["leak_failures"])
+        self.assertEqual(0, result["availability_failures"])
+        self.assertEqual([], rotate_calls)
+        self.assertEqual(3, len(verify_calls))
+
+    def test_rotation_stress_summarizes_partial_success_and_cooldown(self):
+        responses = [
+            {
+                "ok": False,
+                "outcome": "partial_success",
+                "results": [
+                    {"instance": "surfshark_0", "ok": True, "outcome": "success"},
+                    {"instance": "surfshark_1", "ok": False, "outcome": "cooldown"},
+                ],
+            },
+            {
+                "ok": True,
+                "outcome": "success",
+                "results": [
+                    {"instance": "surfshark_0", "ok": True, "outcome": "success"},
+                ],
+            },
+        ]
+
+        def fake_api(cfg, method, path, timeout=15):
+            self.assertEqual("POST", method)
+            self.assertEqual("/rotate/all", path)
+            return responses.pop(0)
+
+        self.chamosel.api_call = fake_api
+        self.chamosel.verify_leaks = lambda cfg, target, timeout: {
+            "ok": True,
+            "verified_count": 2,
+            "total_count": 2,
+            "instances": [],
+        }
+
+        result = self.chamosel.run_stress(
+            self.cfg,
+            iterations=2,
+            mode="rotation",
+            target="https://ifconfig.co/json",
+            timeout=7,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual("rotation", result["mode"])
+        self.assertEqual(2, result["mass_rotation_attempts"])
+        self.assertEqual(1, result["partial_success_count"])
+        self.assertEqual(1, result["cooldown_skip_count"])
+        self.assertEqual(2, result["rotation_outcomes"]["success"])
+        self.assertEqual(1, result["rotation_outcomes"]["cooldown"])
 
     def test_readme_documents_leak_verification_examples_and_limits(self):
         readme = (ROOT / "README.md").read_text()

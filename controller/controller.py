@@ -39,7 +39,7 @@ Endpoints:
   GET  /metrics                  Prometheus exposition format
   POST /rotate                   rotate one random eligible instance
   POST /rotate/<name>            rotate a named instance
-  POST /rotate/all               rotate every instance (sequential)
+  POST /rotate/all               rotate every eligible instance (sequential)
 """
 
 import json
@@ -72,13 +72,21 @@ STATUS_UNAUTHORIZED = "unauthorized"
 STATUS_UNSUPPORTED_CONTROL = "unsupported_control"
 
 OUTCOME_SUCCESS = "success"
+OUTCOME_HEALTHY_IP_UNCHANGED = "healthy_ip_unchanged"
+OUTCOME_PROXY_FAILURE = "proxy_failure"
 OUTCOME_COOLDOWN = "cooldown"
 OUTCOME_UNKNOWN_INSTANCE = "unknown_instance"
+OUTCOME_UNHEALTHY = "unhealthy"
 OUTCOME_UNAUTHORIZED = "unauthorized"
 OUTCOME_UNSUPPORTED_CONTROL = "unsupported_control"
 OUTCOME_CONTROL_UNREACHABLE = "control_unreachable"
 OUTCOME_COMMAND_ERROR = "command_error"
 OUTCOME_RECOVERY_TIMEOUT = "recovery_timeout"
+
+AGG_OUTCOME_SUCCESS = "success"
+AGG_OUTCOME_PARTIAL_SUCCESS = "partial_success"
+AGG_OUTCOME_ALL_SKIPPED = "all_skipped"
+AGG_OUTCOME_FAILED = "failed"
 
 # New control API (gluetun v3.41+) first, then legacy (v3.40 and older).
 STATUS_PATHS = ("/v1/vpn/status", "/v1/openvpn/status")
@@ -112,10 +120,19 @@ class State:
                 "rotations": 0,
                 "rotation_errors": 0,
                 "last_rotated": 0.0,
+                "last_rotation_attempted": 0.0,
+                "last_rotation_message": None,
+                "last_rotation_old_ip": None,
+                "last_rotation_new_ip": None,
                 "last_seen": 0.0,
                 "last_rotation_outcome": None,
                 "status_path": None,       # cached working control path
                 "rotation_errors_by_outcome": {},
+                "cooldown_started_at": 0.0,
+                "cooldown_until": 0.0,
+                "cooldown_reason": None,
+                "cooldown_attempt_count": 0,
+                "forced_bypass_count": 0,
             }
             for name in INSTANCES
         }
@@ -133,7 +150,11 @@ class State:
                     for k in ("ip_history", "rotations", "rotation_errors",
                               "last_rotated", "public_ip", "status_path",
                               "status", "last_error", "last_rotation_outcome",
-                              "rotation_errors_by_outcome"):
+                              "rotation_errors_by_outcome", "last_rotation_attempted",
+                              "last_rotation_message", "last_rotation_old_ip",
+                              "last_rotation_new_ip", "cooldown_started_at",
+                              "cooldown_until", "cooldown_reason",
+                              "cooldown_attempt_count", "forced_bypass_count"):
                         if k in s:
                             self.inst[name][k] = s[k]
             self.rotations_total = saved.get("rotations_total", 0)
@@ -174,10 +195,22 @@ class State:
                     del s["ip_history"][IP_HISTORY_MAX:]
             self._save_locked()
 
-    def record_rotation(self, name: str, outcome: str):
+    def record_rotation(
+        self,
+        name: str,
+        outcome: str,
+        message: str | None = None,
+        old_ip: str | None = None,
+        new_ip: str | None = None,
+    ):
         with self.lock:
             s = self.inst[name]
             s["last_rotation_outcome"] = outcome
+            s["last_rotation_attempted"] = time.time()
+            if message is not None:
+                s["last_rotation_message"] = message
+            s["last_rotation_old_ip"] = old_ip
+            s["last_rotation_new_ip"] = new_ip
             if outcome == OUTCOME_SUCCESS:
                 s["rotations"] += 1
                 s["last_rotated"] = time.time()
@@ -189,9 +222,22 @@ class State:
                 self.rotation_errors_by_outcome[outcome] = self.rotation_errors_by_outcome.get(outcome, 0) + 1
             self._save_locked()
 
-    def mark_rotation_outcome(self, name: str, outcome: str):
+    def mark_rotation_outcome(
+        self,
+        name: str,
+        outcome: str,
+        message: str | None = None,
+        old_ip: str | None = None,
+        new_ip: str | None = None,
+    ):
         with self.lock:
-            self.inst[name]["last_rotation_outcome"] = outcome
+            s = self.inst[name]
+            s["last_rotation_outcome"] = outcome
+            s["last_rotation_attempted"] = time.time()
+            if message is not None:
+                s["last_rotation_message"] = message
+            s["last_rotation_old_ip"] = old_ip
+            s["last_rotation_new_ip"] = new_ip
             self._save_locked()
 
     def set_status_path(self, name: str, path: str):
@@ -217,18 +263,69 @@ class State:
 
     def cooldown_remaining(self, name: str) -> float:
         with self.lock:
-            elapsed = time.time() - self.inst[name]["last_rotated"]
-            return max(0.0, ROTATE_COOLDOWN - elapsed)
+            s = self.inst[name]
+            now = time.time()
+            success_elapsed = now - s["last_rotated"] if s["last_rotated"] else ROTATE_COOLDOWN
+            success_remaining = max(0.0, ROTATE_COOLDOWN - success_elapsed)
+            failure_remaining = max(0.0, float(s.get("cooldown_until") or 0.0) - now)
+            return max(success_remaining, failure_remaining)
+
+    def cooldown_info(self, name: str) -> dict:
+        with self.lock:
+            s = self.inst[name]
+            now = time.time()
+            success_elapsed = now - s["last_rotated"] if s["last_rotated"] else ROTATE_COOLDOWN
+            success_remaining = max(0.0, ROTATE_COOLDOWN - success_elapsed)
+            failure_remaining = max(0.0, float(s.get("cooldown_until") or 0.0) - now)
+            remaining = max(success_remaining, failure_remaining)
+            reason = s.get("cooldown_reason")
+            if remaining > 0 and not reason and s.get("last_rotated"):
+                reason = OUTCOME_COOLDOWN
+            return {
+                "cooldown_started_at": s.get("cooldown_started_at", 0.0),
+                "cooldown_until": s.get("cooldown_until", 0.0),
+                "cooldown_remaining_seconds": round(remaining, 3),
+                "cooldown_reason": reason,
+                "cooldown_attempt_count": s.get("cooldown_attempt_count", 0),
+                "forced_bypass_count": s.get("forced_bypass_count", 0),
+            }
+
+    def start_cooldown(self, name: str, reason: str, duration: int | None = None):
+        with self.lock:
+            s = self.inst[name]
+            now = time.time()
+            s["cooldown_started_at"] = now
+            s["cooldown_until"] = now + (ROTATE_COOLDOWN if duration is None else duration)
+            s["cooldown_reason"] = reason
+            s["cooldown_attempt_count"] = int(s.get("cooldown_attempt_count") or 0) + 1
+            self._save_locked()
+
+    def record_forced_bypass(self, name: str):
+        with self.lock:
+            self.inst[name]["forced_bypass_count"] = int(self.inst[name].get("forced_bypass_count") or 0) + 1
+            self._save_locked()
 
     def snapshot(self) -> dict:
         with self.lock:
+            now = time.time()
+            instances = []
+            for state in self.inst.values():
+                s = dict(state)
+                success_elapsed = now - s["last_rotated"] if s["last_rotated"] else ROTATE_COOLDOWN
+                success_remaining = max(0.0, ROTATE_COOLDOWN - success_elapsed)
+                failure_remaining = max(0.0, float(s.get("cooldown_until") or 0.0) - now)
+                remaining = max(success_remaining, failure_remaining)
+                if remaining > 0 and not s.get("cooldown_reason") and s.get("last_rotated"):
+                    s["cooldown_reason"] = OUTCOME_COOLDOWN
+                s["cooldown_remaining_seconds"] = round(remaining, 3)
+                instances.append(s)
             return {
                 "count": len(INSTANCES),
                 "healthy": sum(1 for s in self.inst.values() if s["healthy"]),
                 "rotations_total": self.rotations_total,
                 "rotation_errors_total": self.rotation_errors_total,
                 "rotation_errors_by_outcome": dict(self.rotation_errors_by_outcome),
-                "instances": [dict(s) for s in self.inst.values()],
+                "instances": instances,
             }
 
 
@@ -358,7 +455,17 @@ def refresh_instances(instances=None):
     return results
 
 
-def wait_for_recovery(instance: str, old_ip, timeout: int = ROTATION_RECOVERY_TIMEOUT) -> tuple[bool, str | None]:
+def verify_proxy_after_rotation(instance: str) -> tuple[bool, str | None]:
+    """Hook point for post-rotation proxy verification.
+
+    The controller stays stdlib-only and does not need external IP lookup here;
+    the CLI leak verifier remains the stronger end-to-end check. Tests can
+    replace this hook to verify proxy-failure handling.
+    """
+    return True, None
+
+
+def wait_for_recovery(instance: str, old_ip, timeout: int = ROTATION_RECOVERY_TIMEOUT) -> tuple[str, str | None, str | None]:
     deadline = time.time() + timeout
     while time.time() < deadline:
         h = is_healthy(instance)
@@ -366,9 +473,15 @@ def wait_for_recovery(instance: str, old_ip, timeout: int = ROTATION_RECOVERY_TI
             new_ip = get_public_ip(instance)
             if new_ip and new_ip != old_ip:
                 STATE.update_health(instance, True, new_ip, status=STATUS_HEALTHY)
-                return True, new_ip
+                proxy_ok, proxy_error = verify_proxy_after_rotation(instance)
+                if not proxy_ok:
+                    return OUTCOME_PROXY_FAILURE, new_ip, proxy_error
+                return OUTCOME_SUCCESS, new_ip, None
+            if new_ip and old_ip and new_ip == old_ip:
+                STATE.update_health(instance, True, new_ip, status=STATUS_HEALTHY)
+                return OUTCOME_HEALTHY_IP_UNCHANGED, new_ip, None
         sleep(1)
-    return False, None
+    return OUTCOME_RECOVERY_TIMEOUT, None, None
 
 
 def rotation_response(instance: str | None, ok: bool, outcome: str, started_at: float, **extra) -> dict:
@@ -383,6 +496,24 @@ def rotation_response(instance: str | None, ok: bool, outcome: str, started_at: 
     return payload
 
 
+def skipped_cooldown_response(instance: str, started_at: float, bypassed: bool = False) -> dict:
+    info = STATE.cooldown_info(instance)
+    STATE.mark_rotation_outcome(
+        instance,
+        OUTCOME_COOLDOWN,
+        message=f"cooldown: {info['cooldown_remaining_seconds']:.0f}s remaining",
+    )
+    return rotation_response(
+        instance,
+        False,
+        OUTCOME_COOLDOWN,
+        started_at,
+        message=f"cooldown: {info['cooldown_remaining_seconds']:.0f}s remaining",
+        forced_bypass=bypassed,
+        **info,
+    )
+
+
 def rotate_instance(instance: str, force: bool = False) -> dict:
     """Graceful rotation: PUT status stopped, then running. New server, no
     container restart. HAProxy drops the instance via health checks while it
@@ -391,46 +522,62 @@ def rotate_instance(instance: str, force: bool = False) -> dict:
     if instance not in INSTANCES:
         return rotation_response(instance, False, OUTCOME_UNKNOWN_INSTANCE, started_at,
                                  message="unknown instance")
+    forced_bypass = False
+    if force and STATE.cooldown_remaining(instance) > 0:
+        STATE.record_forced_bypass(instance)
+        forced_bypass = True
     if not force:
         cd = STATE.cooldown_remaining(instance)
         if cd > 0:
-            STATE.mark_rotation_outcome(instance, OUTCOME_COOLDOWN)
-            return rotation_response(instance, False, OUTCOME_COOLDOWN, started_at,
-                                     message=f"cooldown: {cd:.0f}s remaining")
+            return skipped_cooldown_response(instance, started_at)
     path = detect_status_path(instance)
     if not path:
         current = next((s for s in STATE.snapshot()["instances"] if s["name"] == instance), {})
         outcome = status_to_rotation_outcome(current.get("status", STATUS_UNREACHABLE))
-        STATE.record_rotation(instance, outcome)
+        STATE.record_rotation(instance, outcome, message="control server unreachable/unauthorized")
         return rotation_response(instance, False, outcome, started_at,
-                                 message="control server unreachable/unauthorized")
+                                 message="control server unreachable/unauthorized",
+                                 forced_bypass=forced_bypass)
     old_ip = STATE.inst[instance]["public_ip"] or get_public_ip(instance)
     try:
         _ctrl("PUT", instance, path, {"status": "stopped"})
         sleep(1)
         _ctrl("PUT", instance, path, {"status": "running"})
     except Exception as e:
-        STATE.record_rotation(instance, OUTCOME_COMMAND_ERROR)
+        STATE.record_rotation(instance, OUTCOME_COMMAND_ERROR, message=str(e), old_ip=old_ip)
         return rotation_response(instance, False, OUTCOME_COMMAND_ERROR, started_at,
-                                 old_ip=old_ip, message=str(e))
+                                 old_ip=old_ip, message=str(e),
+                                 forced_bypass=forced_bypass)
     STATE.update_health(instance, False, old_ip, status=STATUS_RECONNECTING)
-    recovered, new_ip = wait_for_recovery(instance, old_ip)
-    if not recovered:
-        STATE.record_rotation(instance, OUTCOME_RECOVERY_TIMEOUT)
+    outcome, new_ip, recovery_error = wait_for_recovery(instance, old_ip)
+    if outcome != OUTCOME_SUCCESS:
+        if outcome in (OUTCOME_RECOVERY_TIMEOUT, OUTCOME_PROXY_FAILURE):
+            STATE.start_cooldown(instance, outcome)
+        message = {
+            OUTCOME_HEALTHY_IP_UNCHANGED: "VPN recovered but public IP did not change",
+            OUTCOME_PROXY_FAILURE: f"VPN recovered but proxy verification failed: {recovery_error}",
+            OUTCOME_RECOVERY_TIMEOUT: f"VPN did not recover with a new IP within {ROTATION_RECOVERY_TIMEOUT}s",
+        }.get(outcome, outcome.replace("_", " "))
+        STATE.record_rotation(instance, outcome, message=message, old_ip=old_ip, new_ip=new_ip)
         return rotation_response(
             instance,
             False,
-            OUTCOME_RECOVERY_TIMEOUT,
+            outcome,
             started_at,
             old_ip=old_ip,
             new_ip=new_ip,
-            message=f"VPN did not recover with a new IP within {ROTATION_RECOVERY_TIMEOUT}s",
+            message=message,
+            forced_bypass=forced_bypass,
+            **STATE.cooldown_info(instance),
         )
-    STATE.record_rotation(instance, OUTCOME_SUCCESS)
+    message = "rotation recovered with a changed public IP"
+    STATE.record_rotation(instance, OUTCOME_SUCCESS, message=message, old_ip=old_ip, new_ip=new_ip)
     log(f"rotated {instance} ({old_ip} -> {new_ip})")
     return rotation_response(instance, True, OUTCOME_SUCCESS, started_at,
                              old_ip=old_ip, new_ip=new_ip,
-                             message="rotation recovered with a changed public IP")
+                             message=message,
+                             forced_bypass=forced_bypass,
+                             **STATE.cooldown_info(instance))
 
 
 def rotate_one_random(force: bool = False) -> dict:
@@ -441,6 +588,50 @@ def rotate_one_random(force: bool = False) -> dict:
                                  message="all instances in cooldown")
     candidates.sort(key=lambda n: STATE.inst[n]["last_rotated"])
     return rotate_instance(candidates[0], force=force)
+
+
+def rotate_all(force: bool = False) -> dict:
+    started_at = time.monotonic()
+    results = []
+    eligible = []
+    skipped = []
+    for inst in INSTANCES:
+        if not force and STATE.cooldown_remaining(inst) > 0:
+            skipped.append(skipped_cooldown_response(inst, started_at))
+        else:
+            eligible.append(inst)
+    for inst in eligible:
+        results.append(rotate_instance(inst, force=force))
+    all_results = skipped + results
+    success_count = sum(1 for r in all_results if r.get("outcome") == OUTCOME_SUCCESS)
+    unchanged_count = sum(1 for r in all_results if r.get("outcome") == OUTCOME_HEALTHY_IP_UNCHANGED)
+    skipped_count = sum(1 for r in all_results if r.get("outcome") == OUTCOME_COOLDOWN)
+    failure_count = sum(1 for r in all_results if not r.get("ok") and r.get("outcome") != OUTCOME_COOLDOWN)
+    cooldown_count = sum(1 for i in INSTANCES if STATE.cooldown_remaining(i) > 0)
+    if all_results and success_count == len(all_results):
+        outcome = AGG_OUTCOME_SUCCESS
+        ok = True
+    elif skipped_count == len(all_results) and all_results:
+        outcome = AGG_OUTCOME_ALL_SKIPPED
+        ok = False
+    elif success_count or unchanged_count or skipped_count:
+        outcome = AGG_OUTCOME_PARTIAL_SUCCESS
+        ok = False
+    else:
+        outcome = AGG_OUTCOME_FAILED
+        ok = False
+    return {
+        "ok": ok,
+        "outcome": outcome,
+        "elapsed_seconds": round(time.monotonic() - started_at, 3),
+        "eligible_count": len(eligible),
+        "skipped_count": skipped_count,
+        "success_count": success_count,
+        "unchanged_count": unchanged_count,
+        "failure_count": failure_count,
+        "cooldown_count": cooldown_count,
+        "results": all_results,
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -490,6 +681,12 @@ def render_metrics() -> str:
         "# TYPE chamosel_instance_rotations_total counter",
         "# HELP chamosel_instance_rotation_errors_by_outcome_total Per-instance failed rotations by outcome.",
         "# TYPE chamosel_instance_rotation_errors_by_outcome_total counter",
+        "# HELP chamosel_instance_rotation_outcome Per-instance latest rotation outcome label.",
+        "# TYPE chamosel_instance_rotation_outcome gauge",
+        "# HELP chamosel_instance_rotation_cooldown_active Per-instance active rotation cooldown.",
+        "# TYPE chamosel_instance_rotation_cooldown_active gauge",
+        "# HELP chamosel_instance_rotation_cooldown_remaining_seconds Per-instance rotation cooldown remaining seconds.",
+        "# TYPE chamosel_instance_rotation_cooldown_remaining_seconds gauge",
     ]
     for outcome, value in snap.get("rotation_errors_by_outcome", {}).items():
         lines.append(f'chamosel_rotation_errors_by_outcome_total{{outcome="{outcome}"}} {value}')
@@ -503,6 +700,14 @@ def render_metrics() -> str:
                 f'chamosel_instance_rotation_errors_by_outcome_total'
                 f'{{instance="{s["name"]}",outcome="{outcome}"}} {value}'
             )
+        if s.get("last_rotation_outcome"):
+            lines.append(
+                f'chamosel_instance_rotation_outcome'
+                f'{{instance="{s["name"]}",outcome="{s["last_rotation_outcome"]}"}} 1'
+            )
+        remaining = s.get("cooldown_remaining_seconds") or 0
+        lines.append(f'chamosel_instance_rotation_cooldown_active{{instance="{s["name"]}"}} {1 if remaining > 0 else 0}')
+        lines.append(f'chamosel_instance_rotation_cooldown_remaining_seconds{{instance="{s["name"]}"}} {remaining}')
     return "\n".join(lines) + "\n"
 
 
@@ -515,11 +720,15 @@ def render_dashboard() -> str:
         last_rot = "never" if not s["last_rotated"] else f"{int(now - s['last_rotated'])}s ago"
         hist = ", ".join(s["ip_history"][:5]) or "-"
         state = s.get("status") or ("healthy" if s["healthy"] else "down")
+        outcome = s.get("last_rotation_outcome") or "-"
+        cooldown = s.get("cooldown_remaining_seconds") or 0
+        cooldown_text = f"{cooldown:.0f}s ({s.get('cooldown_reason')})" if cooldown > 0 else "-"
         rows.append(
             f'<tr><td><span class="dot" style="background:{dot}"></span>{s["name"]}</td>'
             f'<td>{state}</td>'
             f'<td class="ip">{s["public_ip"] or "-"}</td>'
             f'<td>{s["rotations"]}</td><td>{last_rot}</td>'
+            f'<td>{outcome}</td><td>{cooldown_text}</td>'
             f'<td class="hist">{hist}</td></tr>'
         )
     return f"""<!doctype html><html><head><meta charset="utf-8">
@@ -547,7 +756,7 @@ def render_dashboard() -> str:
 </div>
 <p><button onclick="fetch('/rotate',{{method:'POST'}}).then(()=>setTimeout(()=>location.reload(),1200))">Rotate one</button></p>
 <table>
-  <tr><th>instance</th><th>state</th><th>public ip</th><th>rotations</th><th>last rotated</th><th>recent ips</th></tr>
+  <tr><th>instance</th><th>state</th><th>public ip</th><th>rotations</th><th>last rotated</th><th>outcome</th><th>cooldown</th><th>recent ips</th></tr>
   {''.join(rows)}
 </table></body></html>"""
 
@@ -591,7 +800,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/rotate":
             self._json(200, rotate_one_random())
         elif self.path == "/rotate/all":
-            self._json(200, {"results": [rotate_instance(i, force=True) for i in INSTANCES]})
+            self._json(200, rotate_all())
         elif self.path.startswith("/rotate/"):
             self._json(200, rotate_instance(self.path[len("/rotate/"):], force=True))
         else:
