@@ -207,6 +207,7 @@ chamosel_instance_public_ip_mismatch{instance="..."}
 ```yaml
 global_settings:
   proxy_port: 8888
+  proxy_bind: 127.0.0.1     # bind HAProxy request endpoint
   api_bind: 127.0.0.1       # use 0.0.0.0 only behind firewall/auth
   stats_port: 8404
   stats_bind: 127.0.0.1
@@ -272,7 +273,7 @@ $res = $client->fetchWithRetry('https://example.com/products');
 - **Provider secrets:** keep VPN credentials out of `config.yml` when possible. Copy `.env.example` to `.env.local`, set `global_settings.env_file: .env.local`, and put values such as `WIREGUARD_PRIVATE_KEY` there. `.env.local` is ignored by Git.
 - **Image freshness:** `chamosel.py up` runs `docker compose pull --ignore-buildable` before starting the stack so runtime images such as gluetun do not silently stay stale. Use `chamosel.py up --no-pull` when you intentionally want to use only local cached images.
 - **Surfshark:** start live validation around `num_containers: 5` and increase carefully. Frequent `rotate/all` can run into provider recovery delays even when leak-only verification is stable.
-- **API/dashboard exposure:** ports `8800` and `8404` bind to localhost by default. If you set `api_bind` to `0.0.0.0`, enable `controller_auth_enabled: true`; keep firewall/reverse-proxy controls in front of any public host bind. HAProxy stats still needs network-level protection if `stats_bind` is public.
+- **API/dashboard exposure:** ports `8888`, `8800`, and `8404` bind to localhost by default through `proxy_bind`, `api_bind`, and `stats_bind`. If you set `api_bind` to `0.0.0.0`, enable `controller_auth_enabled: true`; keep firewall/reverse-proxy controls in front of any public host bind. HAProxy proxy and stats endpoints need network-level protection if `proxy_bind` or `stats_bind` is public.
 - **Docker volumes:** `chamosel.py down` preserves volumes (gluetun servers cache + state). Use `docker compose down -v` to wipe everything.
 - **Python runtime:** `dataclasses` is part of Python's standard library in supported Python versions. If it is missing, the host is running an old Python interpreter; install Python 3.10+ and use a virtual environment.
 

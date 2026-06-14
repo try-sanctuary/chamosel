@@ -38,7 +38,7 @@ services:
     container_name: chamosel-haproxy
     image: {{ haproxy_image }}
     ports:
-      - "{{ proxy_port }}:{{ proxy_port }}/tcp"
+      - "{{ proxy_bind }}:{{ proxy_port }}:{{ proxy_port }}/tcp"
       - "{{ stats_bind }}:{{ stats_port }}:{{ stats_port }}/tcp"
     restart: unless-stopped
     volumes:

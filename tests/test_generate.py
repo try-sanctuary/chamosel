@@ -85,11 +85,12 @@ class GenerateTests(unittest.TestCase):
         self.assertEqual("abc#def:ghi", env["WIREGUARD_PRIVATE_KEY"])
         self.assertEqual("Germany,Netherlands", env["SERVER_COUNTRIES"])
 
-    def test_controller_and_stats_bind_to_loopback_by_default(self):
+    def test_proxy_controller_and_stats_bind_to_loopback_by_default(self):
         self.chamosel.generate(self.base_config())
 
         compose = yaml.safe_load(Path("docker-compose.yml").read_text())
 
+        self.assertIn("127.0.0.1:8888:8888/tcp", compose["services"]["haproxy"]["ports"])
         self.assertIn("127.0.0.1:8800:8800/tcp", compose["services"]["controller"]["ports"])
         self.assertIn("127.0.0.1:8404:8404/tcp", compose["services"]["haproxy"]["ports"])
 
@@ -119,8 +120,21 @@ class GenerateTests(unittest.TestCase):
         self.assertIn("CONTROLLER_AUTH_TOKEN=controller-secret\n", env_text)
         self.assertEqual("true", controller_env["CONTROLLER_AUTH_ENABLED"])
         self.assertEqual("${CONTROLLER_AUTH_TOKEN}", controller_env["CONTROLLER_AUTH_TOKEN"])
+        self.assertIn("0.0.0.0:8888:8888/tcp", compose["services"]["haproxy"]["ports"])
         self.assertIn("0.0.0.0:8800:8800/tcp", compose["services"]["controller"]["ports"])
         self.assertIn("0.0.0.0:8404:8404/tcp", compose["services"]["haproxy"]["ports"])
+
+    def test_explicit_proxy_bind_renders_independently_from_api_bind(self):
+        cfg = self.base_config()
+        cfg["global_settings"]["proxy_bind"] = "10.20.20.3"
+        cfg["global_settings"]["api_bind"] = "127.0.0.1"
+        cfg["global_settings"]["proxy_port"] = 8890
+
+        self.chamosel.generate(cfg)
+        compose = yaml.safe_load(Path("docker-compose.yml").read_text())
+
+        self.assertIn("10.20.20.3:8890:8890/tcp", compose["services"]["haproxy"]["ports"])
+        self.assertIn("127.0.0.1:8800:8800/tcp", compose["services"]["controller"]["ports"])
 
     def test_controller_auth_token_can_come_from_env_local(self):
         cfg = self.base_config()
@@ -270,6 +284,7 @@ class GenerateTests(unittest.TestCase):
         cfg["global_settings"].update(
             {
                 "api_bind": "10.20.20.3",
+                "proxy_bind": "10.20.20.5",
                 "stats_bind": "10.20.20.4",
                 "proxy_port": 8890,
                 "api_port": 8801,
@@ -283,7 +298,7 @@ class GenerateTests(unittest.TestCase):
             self.chamosel.cmd_up(cfg, pull_images=False)
 
         rendered_logs = "\n".join(logs.output)
-        self.assertIn("Proxy http://10.20.20.3:8890", rendered_logs)
+        self.assertIn("Proxy http://10.20.20.5:8890", rendered_logs)
         self.assertIn("API+dashboard http://10.20.20.3:8801", rendered_logs)
         self.assertIn("Stats http://10.20.20.4:8405/stats", rendered_logs)
 

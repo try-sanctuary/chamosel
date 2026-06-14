@@ -1,5 +1,6 @@
 global_settings:
   proxy_port: 8888          # request clients point here
+  proxy_bind: 127.0.0.1     # proxy host bind; use the server IP when exposing to clients
   api_bind: 127.0.0.1       # controller API/dashboard host bind; use 0.0.0.0 only behind firewall/auth
   stats_port: 8404          # HAProxy stats UI at /stats
   stats_bind: 127.0.0.1     # stats host bind; keep local by default on VPS

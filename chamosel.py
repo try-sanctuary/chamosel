@@ -58,6 +58,7 @@ CONTROLLER_PORT = 8800
 
 DEFAULTS = {
     "proxy_port": 8888,
+    "proxy_bind": None,
     "api_bind": "127.0.0.1",
     "stats_bind": "127.0.0.1",
     "stats_port": 8404,
@@ -119,6 +120,8 @@ def load_config(path: str) -> dict:
 
 
 def gset(cfg: dict, key: str):
+    if key == "proxy_bind":
+        return cfg.get("global_settings", {}).get("proxy_bind") or gset(cfg, "api_bind")
     return cfg.get("global_settings", {}).get(key, DEFAULTS[key])
 
 
@@ -377,6 +380,7 @@ def generate(cfg: dict):
         image=gset(cfg, "image"),
         haproxy_image=gset(cfg, "haproxy_image"),
         env_file=gset(cfg, "env_file"),
+        proxy_bind=gset(cfg, "proxy_bind"),
         api_bind=gset(cfg, "api_bind"),
         stats_bind=gset(cfg, "stats_bind"),
         proxy_port=gset(cfg, "proxy_port"),
@@ -1444,7 +1448,7 @@ def cmd_up(cfg, pull_images: bool = True):
     else:
         log.info("Skipping image pull (--no-pull)")
     compose_cmd(["up", "-d", "--build", "--remove-orphans"])
-    proxy_host = display_host(gset(cfg, "api_bind"))
+    proxy_host = display_host(gset(cfg, "proxy_bind"))
     api_host = display_host(gset(cfg, "api_bind"))
     stats_host = display_host(gset(cfg, "stats_bind"))
     log.info(
