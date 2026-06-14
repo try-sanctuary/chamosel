@@ -28,11 +28,14 @@ import ipaddress
 import json
 import logging
 import os
+import re
 import socket
 import secrets
+import stat
 import subprocess
 import sys
 import time
+from urllib.parse import urlparse
 import urllib.request
 
 import yaml
@@ -58,10 +61,15 @@ CONTROLLER_PORT = 8800
 
 DEFAULTS = {
     "proxy_port": 8888,
-    "proxy_bind": None,
+    "proxy_bind": "127.0.0.1",
     "api_bind": "127.0.0.1",
     "stats_bind": "127.0.0.1",
     "stats_port": 8404,
+    "allow_public_proxy": False,
+    "proxy_allowed_cidrs": "",
+    "stats_auth_user": "",
+    "stats_auth_password": "",
+    "stats_allowed_cidrs": "",
     "api_port": 8800,
     "env_file": "",
     "image": "qmcgaw/gluetun:v3",
@@ -120,8 +128,6 @@ def load_config(path: str) -> dict:
 
 
 def gset(cfg: dict, key: str):
-    if key == "proxy_bind":
-        return cfg.get("global_settings", {}).get("proxy_bind") or gset(cfg, "api_bind")
     return cfg.get("global_settings", {}).get(key, DEFAULTS[key])
 
 
@@ -132,6 +138,60 @@ def truthy(value) -> bool:
 def is_loopback_bind(value: str) -> bool:
     value = str(value or "").strip().lower()
     return value in ("127.0.0.1", "localhost", "::1")
+
+
+def is_non_loopback_bind(value: str) -> bool:
+    return not is_loopback_bind(value)
+
+
+def split_csv(value) -> list[str]:
+    return [item.strip() for item in str(value or "").split(",") if item.strip()]
+
+
+def is_mutable_image_ref(value: str) -> bool:
+    value = str(value or "").strip()
+    if not value:
+        return False
+    if "@sha256:" in value:
+        return False
+    return True
+
+
+def validate_name(value: str, label: str):
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", str(value or "")):
+        log.error("Invalid %s %r; use letters, numbers, dots, underscores, or dashes", label, value)
+        sys.exit(1)
+
+
+def validate_env_key(value: str):
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(value or "")):
+        log.error("Invalid provider env key %r; use shell-style uppercase names", value)
+        sys.exit(1)
+
+
+def validate_cidrs(value, label: str) -> list[str]:
+    cidrs = split_csv(value)
+    for cidr in cidrs:
+        try:
+            ipaddress.ip_network(cidr, strict=False)
+        except ValueError:
+            log.error("Invalid %s CIDR %r", label, cidr)
+            sys.exit(1)
+    return cidrs
+
+
+def validate_egress_target_url(target: str):
+    parsed = urlparse(str(target or "").strip())
+    if parsed.scheme != "https" or not parsed.hostname:
+        log.error("egress_verify_target must be an https URL with a hostname")
+        sys.exit(1)
+    try:
+        ip = ipaddress.ip_address(parsed.hostname)
+    except ValueError:
+        return
+    if not ip.is_global:
+        log.error("egress_verify_target must not point at private, loopback, or link-local addresses")
+        sys.exit(1)
 
 
 def iter_instances(cfg: dict):
@@ -202,8 +262,44 @@ def write_env_value(name: str, value: str, path: str = ENV_FILE):
         pass
     if not found:
         lines.append(f"{name}={value}\n")
-    with open(path, "w") as fh:
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
         fh.writelines(lines)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def secret_file_permission_status(path: str) -> dict:
+    try:
+        mode = stat.S_IMODE(os.stat(path).st_mode)
+    except FileNotFoundError:
+        return {"path": path, "exists": False, "ok": True, "mode": None, "error": None}
+    ok = mode & 0o077 == 0
+    return {
+        "path": path,
+        "exists": True,
+        "ok": ok,
+        "mode": oct(mode),
+        "error": None if ok else f"{path} permissions are {oct(mode)}; use chmod 600 {path}",
+    }
+
+
+def warn_secret_file_permissions(cfg: dict):
+    for path in controller_auth_secret_file_paths(cfg):
+        if not path or not os.path.exists(path):
+            continue
+        status = secret_file_permission_status(path)
+        if not status["ok"]:
+            log.warning(status["error"])
+
+
+def warn_mutable_images(cfg: dict):
+    for key in ("image", "haproxy_image"):
+        value = gset(cfg, key)
+        if is_mutable_image_ref(value):
+            log.warning("%s uses mutable image reference %s; pin a sha256 digest for production", key, value)
 
 
 def read_env_api_key(path: str = ENV_FILE) -> str:
@@ -333,15 +429,55 @@ def controller_auth_headers(cfg: dict) -> dict:
     return {"X-Chamosel-Auth": token} if token else {}
 
 
-def validate_controller_exposure(cfg: dict):
-    if is_loopback_bind(gset(cfg, "api_bind")) or controller_auth_enabled(cfg):
-        return
-    log.error(
-        "Refusing to publish the controller API on %s without controller_auth_enabled=true. "
-        "Use api_bind: 127.0.0.1 for local-only access or enable controller auth.",
-        gset(cfg, "api_bind"),
-    )
-    sys.exit(1)
+def validate_config(cfg: dict):
+    if str(gset(cfg, "balance")) not in ("roundrobin", "leastconn", "source", "first"):
+        log.error("Invalid balance %r; allowed values: roundrobin, leastconn, source, first", gset(cfg, "balance"))
+        sys.exit(1)
+    validate_egress_target_url(gset(cfg, "egress_verify_target"))
+    validate_cidrs(gset(cfg, "proxy_allowed_cidrs"), "proxy_allowed_cidrs")
+    validate_cidrs(gset(cfg, "stats_allowed_cidrs"), "stats_allowed_cidrs")
+    for pkey, prov in cfg.get("vpn_providers", {}).items():
+        validate_name(pkey, "provider key")
+        for key in (prov.get("env") or {}).keys():
+            validate_env_key(str(key))
+
+
+def validate_exposure_policy(cfg: dict):
+    validate_config(cfg)
+    api_bind = gset(cfg, "api_bind")
+    proxy_bind = gset(cfg, "proxy_bind")
+    stats_bind = gset(cfg, "stats_bind")
+
+    if is_non_loopback_bind(api_bind) and not controller_auth_enabled(cfg):
+        log.error(
+            "Refusing to publish the controller API on %s without controller_auth_enabled=true. "
+            "Use api_bind: 127.0.0.1 for local-only access or enable controller auth.",
+            api_bind,
+        )
+        sys.exit(1)
+
+    if is_non_loopback_bind(proxy_bind):
+        if not truthy(gset(cfg, "allow_public_proxy")):
+            log.error(
+                "Refusing to publish the request proxy on %s without allow_public_proxy=true "
+                "and proxy_allowed_cidrs. Use proxy_bind: 127.0.0.1 for local-only access.",
+                proxy_bind,
+            )
+            sys.exit(1)
+        if not split_csv(gset(cfg, "proxy_allowed_cidrs")):
+            log.error("Refusing public proxy exposure without proxy_allowed_cidrs")
+            sys.exit(1)
+
+    if is_non_loopback_bind(stats_bind):
+        has_stats_auth = bool(str(gset(cfg, "stats_auth_user")).strip() and str(gset(cfg, "stats_auth_password")).strip())
+        has_stats_allowlist = bool(split_csv(gset(cfg, "stats_allowed_cidrs")))
+        if not has_stats_auth and not has_stats_allowlist:
+            log.error(
+                "Refusing to publish HAProxy stats on %s without stats_auth_user/password "
+                "or stats_allowed_cidrs. Use stats_bind: 127.0.0.1 for local-only access.",
+                stats_bind,
+            )
+            sys.exit(1)
 
 
 def write_text(path: str, content: str):
@@ -359,16 +495,17 @@ def display_host(value: str, fallback: str = "localhost") -> str:
 
 
 def generate(cfg: dict):
-    validate_controller_exposure(cfg)
+    validate_exposure_policy(cfg)
     api_key_info = resolve_api_key_info(cfg)
     controller_auth_info = resolve_controller_auth_info(cfg)
-    api_key = api_key_info.key
+    warn_secret_file_permissions(cfg)
     if api_key_info.source == "config":
         log.info("Persisted global_settings.api_key to %s for controller interpolation", ENV_FILE)
     if controller_auth_info.source == "config":
         log.info("Persisted global_settings.controller_auth_token to %s for controller interpolation", ENV_FILE)
+    warn_mutable_images(cfg)
     # gluetun v3.41+ default-role apikey auth via env (no config.toml mount needed)
-    auth_role = json.dumps({"auth": "apikey", "apikey": api_key}, separators=(",", ":"))
+    auth_role = '{"auth":"apikey","apikey":"${GLUETUN_API_KEY}"}'
     instances = list(iter_instances(cfg))
     names = [n for n, _, _ in instances]
 
@@ -383,6 +520,10 @@ def generate(cfg: dict):
         proxy_bind=gset(cfg, "proxy_bind"),
         api_bind=gset(cfg, "api_bind"),
         stats_bind=gset(cfg, "stats_bind"),
+        proxy_allowed_cidrs=validate_cidrs(gset(cfg, "proxy_allowed_cidrs"), "proxy_allowed_cidrs"),
+        stats_allowed_cidrs=validate_cidrs(gset(cfg, "stats_allowed_cidrs"), "stats_allowed_cidrs"),
+        stats_auth_user=gset(cfg, "stats_auth_user"),
+        stats_auth_password=gset(cfg, "stats_auth_password"),
         proxy_port=gset(cfg, "proxy_port"),
         stats_port=gset(cfg, "stats_port"),
         api_port=gset(cfg, "api_port"),
@@ -416,6 +557,10 @@ def generate(cfg: dict):
         balance=gset(cfg, "balance"),
         gluetun_proxy_port=GLUETUN_PROXY_PORT,
         gluetun_health_port=GLUETUN_HEALTH_PORT,
+        proxy_allowed_cidrs=validate_cidrs(gset(cfg, "proxy_allowed_cidrs"), "proxy_allowed_cidrs"),
+        stats_allowed_cidrs=validate_cidrs(gset(cfg, "stats_allowed_cidrs"), "stats_allowed_cidrs"),
+        stats_auth_user=gset(cfg, "stats_auth_user"),
+        stats_auth_password=gset(cfg, "stats_auth_password"),
     )
     write_text(HAPROXY_FILE, haproxy)
     log.info("Generated %s (%d instances) and %s", COMPOSE_FILE, len(names), HAPROXY_FILE)
@@ -423,12 +568,23 @@ def generate(cfg: dict):
 
 def sanitize_tool_output(text: str) -> str:
     lines = []
+    secret_patterns = [
+        r"(?i)(GLUETUN_API_KEY|CONTROLLER_AUTH_TOKEN|WIREGUARD_PRIVATE_KEY|OPENVPN_PASSWORD|PASSWORD|TOKEN|SECRET|PRIVATE_KEY)=\S+",
+        r"(?i)(apikey|password|token|secret|private[_-]?key)[\"']?\s*[:=]\s*[\"'][^\"']+[\"']",
+    ]
     for raw_line in (text or "").splitlines():
         line = raw_line.strip()
         if not line:
             continue
+        home = os.path.expanduser("~")
+        if home and home != "~":
+            line = line.replace(home, "/home/example")
         if "Location of client config files" in line:
             line = "Location of client config files (default /home/example/.docker)"
+        line = re.sub(r"/Users/[^/\\\s]+", "/Users/example", line)
+        line = re.sub(r"/home/[^/\\\s]+", "/home/example", line)
+        for pattern in secret_patterns:
+            line = re.sub(pattern, lambda m: m.group(1) + "=<redacted>" if "=" in m.group(0) else "<redacted>", line)
         lines.append(line)
     return "\n".join(lines)
 
@@ -489,8 +645,8 @@ def compose_check(args: list, timeout: int = 15) -> dict:
         return {
             "ok": r.returncode == 0,
             "returncode": r.returncode,
-            "stdout": (r.stdout or "").strip(),
-            "stderr": (r.stderr or "").strip(),
+            "stdout": sanitize_tool_output((r.stdout or "").strip()),
+            "stderr": sanitize_tool_output((r.stderr or "").strip()),
         }
     except FileNotFoundError:
         return {"ok": False, "returncode": None, "stdout": "", "stderr": "docker not found"}
@@ -586,8 +742,9 @@ def fetch_direct_ip(target: str, timeout: int) -> tuple[str, dict]:
     return extract_public_ip(payload), payload
 
 
-def fetch_pool_state(cfg: dict) -> dict:
-    url = f"http://localhost:{gset(cfg, 'api_port')}/pool?fresh=1"
+def fetch_pool_state(cfg: dict, repair: bool = False) -> dict:
+    repair_value = "1" if repair else "0"
+    url = f"http://localhost:{gset(cfg, 'api_port')}/pool?fresh=1&repair={repair_value}"
     req = urllib.request.Request(url, method="GET", headers=controller_auth_headers(cfg))
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
@@ -841,6 +998,13 @@ def normalize_dns_probe_result(
                     conclusions.append(str(entry["ip"]))
             if not dns_servers:
                 result_error = "no DNS resolvers found"
+            if result_error is None:
+                connection_ip = connection.get("ip")
+                try:
+                    if not connection_ip or not ipaddress.ip_address(str(connection_ip)).is_global:
+                        result_error = "connection IP is missing or not globally routable"
+                except ValueError:
+                    result_error = "connection IP is malformed"
 
     for server in dns_servers:
         risk = dns_resolver_risk(server.get("ip") or "")
@@ -858,8 +1022,13 @@ def normalize_dns_probe_result(
 
     if resolver_risks and result_error is None:
         result_error = resolver_risks[0]["reason"]
-    if strict_asn and asn_match is False and result_error is None:
-        result_error = "resolver ASN differs from connection ASN"
+    if strict_asn and result_error is None:
+        if not connection_asn:
+            result_error = "connection ASN is missing"
+        elif not dns_asns or any(not s.get("asn") for s in dns_servers):
+            result_error = "resolver ASN is missing"
+        elif asn_match is False:
+            result_error = "resolver ASN differs from connection ASN"
 
     suspected_leak = result_error is not None and bool(dns_servers)
     dns_ok = result_error is None and bool(dns_servers)
@@ -1182,8 +1351,11 @@ def doctor_report(cfg: dict, repair: bool = False) -> dict:
 
     compose = compose_check(["ps"])
     health = api_call_result(cfg, "GET", "/health", timeout=5)
-    pool = api_call_result(cfg, "GET", "/pool?fresh=1", timeout=15)
-    stats = tcp_check("127.0.0.1", int(gset(cfg, "stats_port")), timeout=2)
+    pool = api_call_result(cfg, "GET", "/pool?fresh=1&repair=0", timeout=15)
+    stats_host = str(gset(cfg, "stats_bind"))
+    if stats_host in ("0.0.0.0", "::"):
+        stats_host = "127.0.0.1"
+    stats = tcp_check(stats_host, int(gset(cfg, "stats_port")), timeout=2)
 
     pool_payload = pool.get("payload") if isinstance(pool.get("payload"), dict) else {}
     healthy_count = int(pool_payload.get("healthy") or 0)
@@ -1233,7 +1405,7 @@ def doctor_report(cfg: dict, repair: bool = False) -> dict:
         },
         "haproxy_stats_port": {
             "ok": stats["ok"],
-            "bind": "127.0.0.1",
+            "bind": gset(cfg, "stats_bind"),
             "port": int(gset(cfg, "stats_port")),
             "error": stats["error"],
         },
@@ -1244,9 +1416,20 @@ def doctor_report(cfg: dict, repair: bool = False) -> dict:
             "configured_env_file_exists": configured_env_file_exists,
         },
         "image_freshness": {
-            "ok": True,
+            "ok": not (is_mutable_image_ref(gset(cfg, "image")) or is_mutable_image_ref(gset(cfg, "haproxy_image"))),
             "up_pulls_images_by_default": True,
             "skip_flag": "--no-pull",
+            "mutable_images": [
+                value for value in (gset(cfg, "image"), gset(cfg, "haproxy_image"))
+                if is_mutable_image_ref(value)
+            ],
+        },
+        "runtime_hardening": {
+            "ok": True,
+            "controller_non_root": True,
+            "haproxy_no_new_privileges": True,
+            "controller_no_new_privileges": True,
+            "error": None,
         },
         "controller_auth": {
             "ok": (not auth_enabled) or auth_token_configured,

@@ -16,12 +16,23 @@ defaults
 frontend stats
     mode http
     bind 0.0.0.0:{{ stats_port }}
+{% if stats_allowed_cidrs %}
+    acl allowed_stats_src src {{ stats_allowed_cidrs | join(' ') }}
+    http-request deny unless allowed_stats_src
+{% endif %}
     stats enable
     stats uri /stats
     stats refresh 5s
+{% if stats_auth_user and stats_auth_password %}
+    stats auth {{ stats_auth_user }}:{{ stats_auth_password }}
+{% endif %}
 
 frontend proxy_in
     bind *:{{ proxy_port }}
+{% if proxy_allowed_cidrs %}
+    acl allowed_proxy_src src {{ proxy_allowed_cidrs | join(' ') }}
+    tcp-request connection reject unless allowed_proxy_src
+{% endif %}
     default_backend gluetun_pool
 
 backend gluetun_pool

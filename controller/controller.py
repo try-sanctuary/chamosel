@@ -95,6 +95,7 @@ CONTROLLER_AUTH_ENABLED = os.environ.get("CONTROLLER_AUTH_ENABLED", "false").str
 CONTROLLER_AUTH_TOKEN = os.environ.get("CONTROLLER_AUTH_TOKEN", "").strip()
 CONTROLLER_AUTH_HEADER = "X-Chamosel-Auth"
 CONTROLLER_AUTH_COOKIE = "chamosel_auth"
+CONTROLLER_CSRF_HEADER = "X-Chamosel-CSRF"
 POLL_WORKERS = int(os.environ.get("POLL_WORKERS", str(max(1, min(16, len(INSTANCES) or 1)))))
 
 STATUS_HEALTHY = "healthy"
@@ -114,6 +115,7 @@ OUTCOME_UNSUPPORTED_CONTROL = "unsupported_control"
 OUTCOME_CONTROL_UNREACHABLE = "control_unreachable"
 OUTCOME_COMMAND_ERROR = "command_error"
 OUTCOME_RECOVERY_TIMEOUT = "recovery_timeout"
+OUTCOME_ROTATION_IN_PROGRESS = "rotation_in_progress"
 
 AGG_OUTCOME_SUCCESS = "success"
 AGG_OUTCOME_PARTIAL_SUCCESS = "partial_success"
@@ -138,6 +140,8 @@ DUPLICATE_REPAIR_LOCK = threading.Lock()
 DUPLICATE_REPAIR_IN_FLIGHT = set()
 DUPLICATE_REPAIR_BACKOFF_UNTIL = {}
 DUPLICATE_REPAIR_SCHEDULED_TOTAL = 0
+ROTATION_LOCKS_LOCK = threading.Lock()
+ROTATION_LOCKS = {}
 
 # New control API (gluetun v3.41+) first, then legacy (v3.40 and older).
 STATUS_PATHS = ("/v1/vpn/status", "/v1/openvpn/status")
@@ -178,6 +182,50 @@ def controller_auth_valid(headers) -> bool:
         return True
     cookie_token = controller_auth_cookie(headers)
     return bool(cookie_token) and hmac.compare_digest(str(cookie_token), CONTROLLER_AUTH_TOKEN)
+
+
+def controller_auth_method(headers) -> str | None:
+    if not controller_auth_required():
+        return "disabled"
+    if not CONTROLLER_AUTH_TOKEN:
+        return None
+    supplied = headers.get(CONTROLLER_AUTH_HEADER, "")
+    if supplied and hmac.compare_digest(str(supplied), CONTROLLER_AUTH_TOKEN):
+        return "header"
+    cookie_token = controller_auth_cookie(headers)
+    if cookie_token and hmac.compare_digest(str(cookie_token), CONTROLLER_AUTH_TOKEN):
+        return "cookie"
+    return None
+
+
+def csrf_valid(headers) -> bool:
+    if controller_auth_method(headers) != "cookie":
+        return True
+    return headers.get(CONTROLLER_CSRF_HEADER, "") == "1"
+
+
+def rotation_lock_for(instance: str):
+    with ROTATION_LOCKS_LOCK:
+        lock = ROTATION_LOCKS.get(instance)
+        if lock is None:
+            lock = threading.Lock()
+            ROTATION_LOCKS[instance] = lock
+        return lock
+
+
+def validated_egress_target() -> tuple[bool, str | None]:
+    if not EGRESS_VERIFY_TARGET:
+        return False, "egress verification target is empty"
+    parsed = urlparse(EGRESS_VERIFY_TARGET)
+    if parsed.scheme != "https" or not parsed.hostname:
+        return False, "egress verification target must be an https URL with a hostname"
+    try:
+        ip = ipaddress.ip_address(parsed.hostname)
+    except ValueError:
+        return True, None
+    if not ip.is_global:
+        return False, "egress verification target must not be private, loopback, or link-local"
+    return True, None
 
 
 # --------------------------------------------------------------------------- #
@@ -601,7 +649,8 @@ def _ctrl(method: str, instance: str, path: str, body: dict | None = None):
     if API_KEY:
         headers["X-API-Key"] = API_KEY
     req = urllib.request.Request(url, data=data, method=method, headers=headers)
-    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(req, timeout=HTTP_TIMEOUT) as r:
         raw = r.read().decode()
         return json.loads(raw) if raw else {}
 
@@ -662,8 +711,9 @@ def extract_verified_proxy_metadata(payload: dict) -> dict:
 
 
 def probe_verified_proxy_ip(instance: str) -> tuple[str | None, str | None, dict]:
-    if not EGRESS_VERIFY_TARGET:
-        return None, "egress verification target is empty", {}
+    target_ok, target_error = validated_egress_target()
+    if not target_ok:
+        return None, target_error, {}
     proxy = f"http://{instance}:{GLUETUN_PROXY_PORT}"
     opener = urllib.request.build_opener(
         urllib.request.ProxyHandler({"http": proxy, "https": proxy})
@@ -1015,7 +1065,7 @@ def maybe_schedule_duplicate_ip_repair():
     maybe_schedule_pool_repair()
 
 
-def refresh_instances(instances=None, verify_egress: bool = False, force_egress: bool = False):
+def refresh_instances(instances=None, verify_egress: bool = False, force_egress: bool = False, allow_repair: bool = True):
     instances = list(instances or INSTANCES)
     if not instances:
         return []
@@ -1033,7 +1083,8 @@ def refresh_instances(instances=None, verify_egress: bool = False, force_egress:
             except Exception as e:
                 STATE.update_health(inst, False, None, status=STATUS_UNREACHABLE, error=str(e))
                 results.append({"instance": inst, "healthy": False, "status": STATUS_UNREACHABLE, "error": str(e)})
-    maybe_schedule_pool_repair()
+    if allow_repair:
+        maybe_schedule_pool_repair()
     return results
 
 
@@ -1126,6 +1177,23 @@ def rotate_instance(instance: str, force: bool = False, repair_duplicate_ip: str
     if instance not in INSTANCES:
         return rotation_response(instance, False, OUTCOME_UNKNOWN_INSTANCE, started_at,
                                  message="unknown instance")
+    lock = rotation_lock_for(instance)
+    if not lock.acquire(blocking=False):
+        return rotation_response(
+            instance,
+            False,
+            OUTCOME_ROTATION_IN_PROGRESS,
+            started_at,
+            message="rotation already in progress for this instance",
+        )
+    try:
+        return rotate_instance_locked(instance, started_at, force=force, repair_duplicate_ip=repair_duplicate_ip)
+    finally:
+        lock.release()
+
+
+def rotate_instance_locked(instance: str, started_at: float, force: bool = False, repair_duplicate_ip: str | None = None) -> dict:
+    """Rotate an instance after the caller has acquired its per-instance lock."""
     forced_bypass = False
     if force and STATE.cooldown_remaining(instance) > 0:
         STATE.record_forced_bypass(instance)
@@ -1401,8 +1469,7 @@ document.getElementById("auth-form").addEventListener("submit", async (event) =>
   event.preventDefault();
   const token = document.getElementById("token").value.trim();
   if (!token) return;
-  document.cookie = `${{cookieName}}=${{encodeURIComponent(token)}}; path=/; SameSite=Strict`;
-  const response = await fetch("/pool", {{headers: {{"X-Chamosel-Auth": token}}}});
+  const response = await fetch("/login", {{method: "POST", headers: {{"X-Chamosel-Auth": token}}}});
   if (response.ok) {{
     location.reload();
   }} else {{
@@ -1547,19 +1614,19 @@ function selectedInstance() {{
 function rotateSelected() {{
   const instance = selectedInstance();
   if (!instance) return;
-  fetch(`/rotate/${{encodeURIComponent(instance)}}?force=0`, {{method:'POST'}}).then(reloadSoon);
+  fetch(`/rotate/${{encodeURIComponent(instance)}}?force=0`, {{method:'POST', headers: {{'X-Chamosel-CSRF':'1'}}}}).then(reloadSoon);
 }}
 function repairSelected() {{
   const instance = selectedInstance();
   if (!instance) return;
-  fetch(`/repair/${{encodeURIComponent(instance)}}`, {{method:'POST'}}).then(reloadSoon);
+  fetch(`/repair/${{encodeURIComponent(instance)}}`, {{method:'POST', headers: {{'X-Chamosel-CSRF':'1'}}}}).then(reloadSoon);
 }}
 function toggleAutoRepair() {{
   const enabled = document.getElementById("autoRepairState").textContent.trim() !== "ON";
-  fetch(`/repair/auto?enabled=${{enabled ? "1" : "0"}}`, {{method:'POST'}}).then(reloadSoon);
+  fetch(`/repair/auto?enabled=${{enabled ? "1" : "0"}}`, {{method:'POST', headers: {{'X-Chamosel-CSRF':'1'}}}}).then(reloadSoon);
 }}
 function rotateAny() {{
-  fetch('/rotate', {{method:'POST'}}).then(reloadSoon);
+  fetch('/rotate', {{method:'POST', headers: {{'X-Chamosel-CSRF':'1'}}}}).then(reloadSoon);
 }}
 </script></body></html>"""
 
@@ -1572,10 +1639,12 @@ class Handler(BaseHTTPRequestHandler):
     def _json(self, code: int, payload: dict):
         self._raw(code, json.dumps(payload).encode(), "application/json")
 
-    def _raw(self, code: int, body: bytes, ctype: str):
+    def _raw(self, code: int, body: bytes, ctype: str, headers: dict | None = None):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
 
@@ -1586,6 +1655,14 @@ class Handler(BaseHTTPRequestHandler):
         if controller_auth_valid(getattr(self, "headers", {})):
             return True
         self._json(401, {"error": "unauthorized"})
+        return False
+
+    def _require_mutation_auth(self) -> bool:
+        if not self._require_auth():
+            return False
+        if csrf_valid(getattr(self, "headers", {})):
+            return True
+        self._json(403, {"error": "csrf_required"})
         return False
 
     def do_GET(self):
@@ -1605,17 +1682,27 @@ class Handler(BaseHTTPRequestHandler):
             if not self._require_auth():
                 return
             if parse_qs(parsed.query).get("fresh"):
-                refresh_instances(verify_egress=EGRESS_VERIFY_ON_FRESH)
+                query = parse_qs(parsed.query)
+                allow_repair = query.get("repair", ["0"])[0].strip().lower() in ("1", "true", "yes", "on")
+                refresh_instances(verify_egress=EGRESS_VERIFY_ON_FRESH, allow_repair=allow_repair)
             self._json(200, STATE.snapshot())
         else:
             self._json(404, {"error": "not found"})
 
     def do_POST(self):
-        if not self._require_auth():
+        parsed = urlparse(self.path)
+        if parsed.path == "/login":
+            if not self._require_auth():
+                return
+            cookie = f"{CONTROLLER_AUTH_COOKIE}={CONTROLLER_AUTH_TOKEN}; Path=/; HttpOnly; SameSite=Strict"
+            if self.headers.get("X-Forwarded-Proto", "").lower() == "https":
+                cookie += "; Secure"
+            self._raw(204, b"", "application/json", headers={"Set-Cookie": cookie})
+            return
+        if not self._require_mutation_auth():
             return
         if not INSTANCES:
             return self._json(503, {"error": "no instances configured"})
-        parsed = urlparse(self.path)
         if parsed.path == "/rotate":
             self._json(200, rotate_one_random())
         elif parsed.path == "/rotate/all":
@@ -1631,7 +1718,7 @@ class Handler(BaseHTTPRequestHandler):
         elif parsed.path.startswith("/repair/"):
             self._json(200, repair_selected_instance(parsed.path[len("/repair/"):]))
         elif parsed.path.startswith("/rotate/"):
-            force = parse_qs(parsed.query).get("force", ["1"])[0].strip().lower() not in ("0", "false", "no", "off")
+            force = parse_qs(parsed.query).get("force", ["0"])[0].strip().lower() in ("1", "true", "yes", "on")
             self._json(200, rotate_instance(parsed.path[len("/rotate/"):], force=force))
         else:
             self._json(404, {"error": "not found"})

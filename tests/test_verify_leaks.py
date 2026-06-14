@@ -161,6 +161,29 @@ class VerifyLeakTests(unittest.TestCase):
         self.assertFalse(item["asn_match"])
         self.assertIn("resolver ASN differs", item["error"])
 
+    def test_verify_dns_leaks_fails_missing_connection_ip(self):
+        self.chamosel.fetch_pool_state = lambda cfg: self.pool()
+        payload = [entry for entry in self.dns_payload() if entry.get("type") != "ip"]
+        self.chamosel.run_backend_dns_probe = lambda instance, timeout: payload
+
+        result = self.chamosel.verify_dns_leaks(self.cfg)
+
+        self.assertFalse(result["ok"])
+        item = result["instances"][0]
+        self.assertFalse(item["dns_ok"])
+        self.assertIn("connection IP", item["error"])
+
+    def test_verify_dns_leaks_strict_asn_fails_missing_resolver_asn(self):
+        self.chamosel.fetch_pool_state = lambda cfg: self.pool()
+        self.chamosel.run_backend_dns_probe = lambda instance, timeout: self.dns_payload(dns_asn=None)
+
+        result = self.chamosel.verify_dns_leaks(self.cfg, strict_asn=True)
+
+        self.assertFalse(result["ok"])
+        item = result["instances"][0]
+        self.assertFalse(item["dns_ok"])
+        self.assertIn("resolver ASN is missing", item["error"])
+
     def test_verify_dns_leaks_fails_non_global_resolver(self):
         self.chamosel.fetch_pool_state = lambda cfg: self.pool()
         self.chamosel.run_backend_dns_probe = lambda instance, timeout: self.dns_payload(dns_asn="AS9009")[:-2] + [
@@ -513,7 +536,7 @@ class VerifyLeakTests(unittest.TestCase):
         def fake_api(cfg, method, path, timeout=15):
             if path == "/health":
                 return {"ok": True, "status": 200, "payload": {"status": "ok"}, "error": None}
-            if path == "/pool?fresh=1":
+            if path == "/pool?fresh=1&repair=0":
                 return {
                     "ok": True,
                     "status": 200,
@@ -550,7 +573,7 @@ class VerifyLeakTests(unittest.TestCase):
         def fake_api(cfg, method, path, timeout=15):
             if path == "/health":
                 return {"ok": True, "status": 200, "payload": {"status": "ok"}, "error": None}
-            if path == "/pool?fresh=1":
+            if path == "/pool?fresh=1&repair=0":
                 return {
                     "ok": True,
                     "status": 200,
@@ -572,6 +595,35 @@ class VerifyLeakTests(unittest.TestCase):
         self.assertFalse(report["ok"])
         self.assertFalse(report["checks"]["pool_fresh"]["ok"])
 
+    def test_doctor_reports_mutable_image_warning(self):
+        self.chamosel.compose_check = lambda args: {"ok": True, "returncode": 0, "stdout": "ok", "stderr": ""}
+        self.chamosel.tcp_check = lambda host, port, timeout=2: {"ok": True, "error": None}
+
+        def fake_api(cfg, method, path, timeout=15):
+            if path == "/health":
+                return {"ok": True, "status": 200, "payload": {"status": "ok"}, "error": None}
+            if path == "/pool?fresh=1&repair=0":
+                return {
+                    "ok": True,
+                    "status": 200,
+                    "payload": {
+                        "healthy": 1,
+                        "count": 1,
+                        "pool_status": "healthy",
+                        "state_fresh": True,
+                        "degraded_reasons": [],
+                    },
+                    "error": None,
+                }
+            raise AssertionError(path)
+
+        self.chamosel.api_call_result = fake_api
+
+        report = self.chamosel.doctor_report(self.cfg)
+
+        self.assertFalse(report["checks"]["image_freshness"]["ok"])
+        self.assertIn("qmcgaw/gluetun:v3", report["checks"]["image_freshness"]["mutable_images"])
+
     def test_doctor_reports_duplicate_ip_repair_in_progress(self):
         self.chamosel.compose_check = lambda args: {"ok": True, "returncode": 0, "stdout": "ok", "stderr": ""}
         self.chamosel.tcp_check = lambda host, port, timeout=2: {"ok": True, "error": None}
@@ -579,7 +631,7 @@ class VerifyLeakTests(unittest.TestCase):
         def fake_api(cfg, method, path, timeout=15):
             if path == "/health":
                 return {"ok": True, "status": 200, "payload": {"status": "ok"}, "error": None}
-            if path == "/pool?fresh=1":
+            if path == "/pool?fresh=1&repair=0":
                 return {
                     "ok": True,
                     "status": 200,
@@ -628,7 +680,7 @@ class VerifyLeakTests(unittest.TestCase):
             calls.append((method, path))
             if path == "/health":
                 return {"ok": True, "status": 200, "payload": {"status": "ok"}, "error": None}
-            if path == "/pool?fresh=1":
+            if path == "/pool?fresh=1&repair=0":
                 return {
                     "ok": True,
                     "status": 200,
@@ -674,7 +726,7 @@ class VerifyLeakTests(unittest.TestCase):
             calls.append((method, path))
             if path == "/health":
                 return {"ok": True, "status": 200, "payload": {"status": "ok"}, "error": None}
-            if path == "/pool?fresh=1":
+            if path == "/pool?fresh=1&repair=0":
                 return {
                     "ok": True,
                     "status": 200,
