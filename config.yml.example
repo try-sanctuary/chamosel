@@ -14,7 +14,7 @@ global_settings:
   rotate_all_batch_size: 2  # max concurrent backends rotated by rotate/all
   rotate_all_batch_delay_seconds: 2 # delay between rotate/all batches
   pool_degraded_min_healthy: auto # auto = all configured backends should be healthy
-  auto_repair_duplicate_ips: true # rotate one duplicate-IP backend after health refresh
+  auto_repair_duplicate_ips: true # rotate one duplicate/proxy-failed backend after health refresh
   duplicate_repair_retry_cooldown: 300 # retry delay after failed duplicate-IP repair
   egress_verify_target: https://ifconfig.co/json # target used to verify actual proxy exit IP
   egress_verify_timeout: 10 # per-backend verified proxy IP timeout

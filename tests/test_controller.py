@@ -463,8 +463,52 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual("89.187.163.10", refreshed["verified_proxy_ip"])
         self.assertEqual(["vpn_0"], calls)
 
+    def test_public_ip_change_clears_stale_verified_proxy_ip(self):
+        self.ctrl.STATE.update_health("vpn_0", True, "1.1.1.1", status=self.ctrl.STATUS_HEALTHY)
+        self.ctrl.STATE.update_verified_proxy_ip(
+            "vpn_0",
+            "2.2.2.2",
+            metadata={"country": "Germany", "city": "Berlin"},
+        )
+
+        self.ctrl.STATE.update_health("vpn_0", True, "3.3.3.3", status=self.ctrl.STATUS_HEALTHY)
+        inst = self.ctrl.STATE.snapshot()["instances"][0]
+
+        self.assertEqual("3.3.3.3", inst["public_ip"])
+        self.assertIsNone(inst["verified_proxy_ip"])
+        self.assertIsNone(inst["country"])
+        self.assertIsNone(inst["city"])
+        self.assertFalse(inst["egress_state_fresh"])
+
     def test_extract_verified_proxy_ip_accepts_ifconfig_json(self):
         self.assertEqual("45.134.140.5", self.ctrl.extract_verified_proxy_ip({"ip": "45.134.140.5"}))
+
+    def test_extract_verified_proxy_metadata_accepts_ifconfig_json(self):
+        metadata = self.ctrl.extract_verified_proxy_metadata({
+            "ip": "45.134.140.5",
+            "country": "DE",
+            "country_name": "Germany",
+            "city": "Berlin",
+        })
+
+        self.assertEqual("Germany", metadata["country"])
+        self.assertEqual("Berlin", metadata["city"])
+
+    def test_refresh_verified_proxy_ip_stores_geo_metadata(self):
+        self.ctrl.STATE.update_health("vpn_0", True, "1.1.1.1", status=self.ctrl.STATUS_HEALTHY)
+        self.ctrl.probe_verified_proxy_ip = lambda instance: (
+            "45.134.140.5",
+            None,
+            {"country": "Germany", "city": "Berlin", "source": "verified_proxy_ip"},
+        )
+
+        result = self.ctrl.refresh_verified_proxy_ip("vpn_0", force=True)
+        inst = self.ctrl.STATE.snapshot()["instances"][0]
+
+        self.assertEqual("Germany", result["country"])
+        self.assertEqual("Berlin", result["city"])
+        self.assertEqual("Germany", inst["country"])
+        self.assertEqual("Berlin", inst["city"])
 
     def test_public_ip_mismatch_does_not_schedule_repair_when_verified_ips_unique(self):
         calls = []
@@ -477,6 +521,65 @@ class ControllerTests(unittest.TestCase):
         self.ctrl.maybe_schedule_duplicate_ip_repair()
 
         self.assertEqual([], calls)
+
+    def test_proxy_failure_refresh_schedules_next_auto_repair(self):
+        calls = []
+
+        class ImmediateThread:
+            def __init__(self, target, args=(), daemon=None):
+                self.target = target
+                self.args = args
+
+            def start(self):
+                self.target(*self.args)
+
+        original_thread = self.ctrl.threading.Thread
+        try:
+            self.ctrl.threading.Thread = ImmediateThread
+            self.ctrl.rotate_instance = lambda instance, force=False, repair_duplicate_ip=None: calls.append(
+                (instance, force, repair_duplicate_ip)
+            ) or {"ok": True, "outcome": self.ctrl.OUTCOME_SUCCESS}
+            self.ctrl.STATE.update_health("vpn_0", True, "1.1.1.1", status=self.ctrl.STATUS_HEALTHY)
+            self.ctrl.STATE.record_rotation("vpn_0", self.ctrl.OUTCOME_PROXY_FAILURE)
+            self.ctrl.STATE.update_health("vpn_1", True, "2.2.2.2", status=self.ctrl.STATUS_HEALTHY)
+            self.ctrl.STATE.record_rotation("vpn_1", self.ctrl.OUTCOME_PROXY_FAILURE)
+
+            self.ctrl.maybe_schedule_pool_repair()
+        finally:
+            self.ctrl.threading.Thread = original_thread
+
+        self.assertEqual([("vpn_0", False, None)], calls)
+        self.assertEqual(1, self.ctrl.duplicate_repair_snapshot()["scheduled_total"])
+
+    def test_auto_repair_toggle_disables_background_repair(self):
+        calls = []
+        self.ctrl.rotate_instance = lambda instance, force=False, repair_duplicate_ip=None: calls.append(instance) or {"ok": True}
+        self.ctrl.STATE.update_health("vpn_0", True, "1.1.1.1", status=self.ctrl.STATUS_HEALTHY)
+        self.ctrl.STATE.record_rotation("vpn_0", self.ctrl.OUTCOME_PROXY_FAILURE)
+
+        result = self.ctrl.set_auto_repair_enabled(False)
+        self.ctrl.maybe_schedule_pool_repair()
+
+        self.assertFalse(result["auto_repair_enabled"])
+        self.assertFalse(self.ctrl.duplicate_repair_snapshot()["enabled"])
+        self.assertEqual([], calls)
+
+    def test_auto_repair_toggle_endpoint(self):
+        ctrl = load_controller(
+            self.tmp.name,
+            env_overrides={"CONTROLLER_AUTH_ENABLED": "true", "CONTROLLER_AUTH_TOKEN": "controller-token"},
+        )
+        captured = {}
+
+        handler = ctrl.Handler.__new__(ctrl.Handler)
+        handler.path = "/repair/auto?enabled=0"
+        handler.headers = {"X-Chamosel-Auth": "controller-token"}
+        handler._json = lambda code, payload: captured.update({"code": code, "payload": payload})
+
+        handler.do_POST()
+
+        self.assertEqual(200, captured["code"])
+        self.assertFalse(captured["payload"]["auto_repair_enabled"])
 
     def test_duplicate_ip_repair_once_rotates_one_verified_duplicate(self):
         calls = []
@@ -927,9 +1030,43 @@ class ControllerTests(unittest.TestCase):
 
         self.assertIn('id="refreshSeconds"', html)
         self.assertIn('name="instance"', html)
+        self.assertIn("auto repair", html)
         self.assertIn("Repair selected", html)
         self.assertIn("Rotate selected", html)
         self.assertIn("proxy_failure", html)
+        self.assertNotIn("recent ips", html)
+
+    def test_dashboard_hides_stale_verified_proxy_ip_and_marks_ready(self):
+        self.ctrl.STATE.update_health("vpn_0", True, "1.1.1.1", status=self.ctrl.STATUS_HEALTHY)
+        self.ctrl.STATE.update_verified_proxy_ip(
+            "vpn_0",
+            "2.2.2.2",
+            metadata={"country": "Germany", "city": "Berlin"},
+        )
+        with self.ctrl.STATE.lock:
+            self.ctrl.STATE.inst["vpn_0"]["verified_proxy_ip_seen_at"] = time.time() - 999
+
+        html = self.ctrl.render_dashboard()
+
+        self.assertIn("ready", html)
+        self.assertNotIn("2.2.2.2", html)
+        self.assertNotIn("Germany", html)
+        self.assertNotIn("Berlin", html)
+
+    def test_dashboard_exposes_fresh_verified_proxy_geo(self):
+        self.ctrl.STATE.update_health("vpn_0", True, "1.1.1.1", status=self.ctrl.STATUS_HEALTHY)
+        self.ctrl.STATE.update_verified_proxy_ip(
+            "vpn_0",
+            "2.2.2.2",
+            metadata={"country": "Germany", "city": "Berlin"},
+        )
+
+        html = self.ctrl.render_dashboard()
+
+        self.assertIn("<th>country</th>", html)
+        self.assertIn("<th>city</th>", html)
+        self.assertIn("Germany", html)
+        self.assertIn("Berlin", html)
 
 
 if __name__ == "__main__":
