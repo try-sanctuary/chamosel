@@ -425,20 +425,46 @@ def sanitize_tool_output(text: str) -> str:
     return "\n".join(lines)
 
 
-def compose_cmd(args: list, capture=False):
+_COMPOSE_AVAILABLE = None
+
+
+def ensure_compose_available():
+    global _COMPOSE_AVAILABLE
+    if _COMPOSE_AVAILABLE:
+        return
     try:
+        r = subprocess.run(
+            ["docker", "compose", "version"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        log.error("docker not found")
+        sys.exit(1)
+    if r.returncode != 0:
+        rendered = sanitize_tool_output(r.stderr or r.stdout)
+        if "unknown shorthand flag" in rendered or "is not a docker command" in rendered:
+            rendered = (
+                "Docker Compose v2 plugin is not available or not recognized. "
+                "Install docker-compose-plugin, then verify with `docker compose version`."
+            )
+        log.error("docker compose unavailable: %s", rendered or "no output")
+        sys.exit(1)
+    _COMPOSE_AVAILABLE = True
+
+
+def compose_cmd(args: list, capture=False):
+    ensure_compose_available()
+    try:
+        capture_output = bool(capture)
         r = subprocess.run(["docker", "compose", "-f", COMPOSE_FILE] + args,
-                            text=True, capture_output=True, check=True)
+                            text=True, capture_output=capture_output, check=True)
         return r.stdout if capture else ""
     except FileNotFoundError:
         log.error("docker not found"); sys.exit(1)
     except subprocess.CalledProcessError as e:
         rendered = sanitize_tool_output(e.stderr or e.stdout)
-        if "unknown shorthand flag: 'f' in -f" in rendered:
-            rendered = (
-                "Docker Compose v2 plugin is not available or not recognized. "
-                "Install docker-compose-plugin, then verify with `docker compose version`."
-            )
         log.error("compose %s failed: %s", " ".join(args), rendered or "no output")
         sys.exit(1)
 

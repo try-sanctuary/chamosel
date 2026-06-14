@@ -60,8 +60,9 @@ import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, quote
 
 INSTANCES = [s.strip() for s in os.environ.get("INSTANCES", "").split(",") if s.strip()]
 CONTROL_PORT = int(os.environ.get("GLUETUN_CONTROL_PORT", "8000"))
@@ -87,6 +88,7 @@ EGRESS_VERIFY_ON_FRESH = os.environ.get("EGRESS_VERIFY_ON_FRESH", "true").strip(
 CONTROLLER_AUTH_ENABLED = os.environ.get("CONTROLLER_AUTH_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
 CONTROLLER_AUTH_TOKEN = os.environ.get("CONTROLLER_AUTH_TOKEN", "").strip()
 CONTROLLER_AUTH_HEADER = "X-Chamosel-Auth"
+CONTROLLER_AUTH_COOKIE = "chamosel_auth"
 POLL_WORKERS = int(os.environ.get("POLL_WORKERS", str(max(1, min(16, len(INSTANCES) or 1)))))
 
 STATUS_HEALTHY = "healthy"
@@ -147,13 +149,29 @@ def controller_auth_required() -> bool:
     return CONTROLLER_AUTH_ENABLED
 
 
+def controller_auth_cookie(headers) -> str:
+    raw = headers.get("Cookie", "")
+    if not raw:
+        return ""
+    cookie = SimpleCookie()
+    try:
+        cookie.load(raw)
+    except Exception:
+        return ""
+    morsel = cookie.get(CONTROLLER_AUTH_COOKIE)
+    return morsel.value if morsel else ""
+
+
 def controller_auth_valid(headers) -> bool:
     if not controller_auth_required():
         return True
     if not CONTROLLER_AUTH_TOKEN:
         return False
     supplied = headers.get(CONTROLLER_AUTH_HEADER, "")
-    return hmac.compare_digest(str(supplied), CONTROLLER_AUTH_TOKEN)
+    if supplied and hmac.compare_digest(str(supplied), CONTROLLER_AUTH_TOKEN):
+        return True
+    cookie_token = controller_auth_cookie(headers)
+    return bool(cookie_token) and hmac.compare_digest(str(cookie_token), CONTROLLER_AUTH_TOKEN)
 
 
 # --------------------------------------------------------------------------- #
@@ -1194,6 +1212,47 @@ def render_metrics() -> str:
     return "\n".join(lines) + "\n"
 
 
+def render_login() -> str:
+    cookie_name = quote(CONTROLLER_AUTH_COOKIE)
+    return f"""<!doctype html><html><head><meta charset="utf-8">
+<title>chamosel auth</title>
+<style>
+  body{{font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;background:#0b0f19;color:#e5e7eb;margin:0;padding:24px}}
+  main{{max-width:520px;margin:12vh auto;background:#111827;border:1px solid #1f2937;border-radius:10px;padding:24px}}
+  h1{{font-size:18px;margin:0 0 8px}} p{{color:#9ca3af;margin:0 0 18px}}
+  label{{display:block;color:#9ca3af;font-size:12px;text-transform:uppercase;margin-bottom:6px}}
+  input{{box-sizing:border-box;width:100%;background:#020617;color:#e5e7eb;border:1px solid #334155;border-radius:8px;padding:10px 12px;font:inherit}}
+  button{{margin-top:12px;background:#2563eb;color:#fff;border:0;border-radius:8px;padding:9px 14px;cursor:pointer;font:inherit}}
+  button:hover{{background:#1d4ed8}} .err{{color:#f87171;margin-top:12px;display:none}}
+</style></head><body>
+<main>
+  <h1>chamosel dashboard</h1>
+  <p>Controller auth is enabled. Enter the controller token from your local secret file.</p>
+  <form id="auth-form">
+    <label for="token">Controller token</label>
+    <input id="token" name="token" type="password" autocomplete="current-password" autofocus>
+    <button type="submit">Unlock dashboard</button>
+    <div class="err" id="err">Token was not accepted.</div>
+  </form>
+</main>
+<script>
+const cookieName = "{cookie_name}";
+document.getElementById("auth-form").addEventListener("submit", async (event) => {{
+  event.preventDefault();
+  const token = document.getElementById("token").value.trim();
+  if (!token) return;
+  document.cookie = `${{cookieName}}=${{encodeURIComponent(token)}}; path=/; SameSite=Strict`;
+  const response = await fetch("/pool", {{headers: {{"X-Chamosel-Auth": token}}}});
+  if (response.ok) {{
+    location.reload();
+  }} else {{
+    document.cookie = `${{cookieName}}=; path=/; SameSite=Strict; max-age=0`;
+    document.getElementById("err").style.display = "block";
+  }}
+}});
+</script></body></html>"""
+
+
 def render_dashboard() -> str:
     snap = STATE.snapshot()
     now = time.time()
@@ -1288,7 +1347,8 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/health":
             self._json(200, {"status": "ok", "instances": len(INSTANCES)})
         elif parsed.path == "/":
-            if not self._require_auth():
+            if not controller_auth_valid(getattr(self, "headers", {})):
+                self._raw(401, render_login().encode(), "text/html; charset=utf-8")
                 return
             self._raw(200, render_dashboard().encode(), "text/html; charset=utf-8")
         elif parsed.path == "/metrics":

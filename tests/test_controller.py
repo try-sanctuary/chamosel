@@ -169,6 +169,49 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(200, captured["code"])
         self.assertIn("instances", captured["payload"])
 
+    def test_controller_auth_dashboard_prompts_for_token(self):
+        ctrl = load_controller(
+            self.tmp.name,
+            env_overrides={"CONTROLLER_AUTH_ENABLED": "true", "CONTROLLER_AUTH_TOKEN": "controller-token"},
+        )
+        captured = {}
+
+        handler = ctrl.Handler.__new__(ctrl.Handler)
+        handler.path = "/"
+        handler.headers = {}
+        handler._raw = lambda code, body, ctype: captured.update(
+            {"code": code, "body": body.decode(), "ctype": ctype}
+        )
+
+        handler.do_GET()
+
+        self.assertEqual(401, captured["code"])
+        self.assertIn("text/html", captured["ctype"])
+        self.assertIn("Controller token", captured["body"])
+        self.assertIn("Unlock dashboard", captured["body"])
+        self.assertNotIn("controller-token", captured["body"])
+
+    def test_controller_auth_dashboard_accepts_cookie_token(self):
+        ctrl = load_controller(
+            self.tmp.name,
+            env_overrides={"CONTROLLER_AUTH_ENABLED": "true", "CONTROLLER_AUTH_TOKEN": "controller-token"},
+        )
+        captured = {}
+
+        handler = ctrl.Handler.__new__(ctrl.Handler)
+        handler.path = "/"
+        handler.headers = {"Cookie": "chamosel_auth=controller-token"}
+        handler._raw = lambda code, body, ctype: captured.update(
+            {"code": code, "body": body.decode(), "ctype": ctype}
+        )
+
+        handler.do_GET()
+
+        self.assertEqual(200, captured["code"])
+        self.assertIn("text/html", captured["ctype"])
+        self.assertIn("chamosel", captured["body"])
+        self.assertNotIn("controller-token", captured["body"])
+
     def test_controller_health_remains_public_when_auth_enabled(self):
         ctrl = load_controller(
             self.tmp.name,

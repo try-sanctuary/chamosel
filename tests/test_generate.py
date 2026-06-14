@@ -286,12 +286,12 @@ class GenerateTests(unittest.TestCase):
 
     def test_compose_cmd_sanitizes_missing_plugin_help_output(self):
         leaked_help = (
-            "unknown shorthand flag: 'f' in -f\n"
+            "docker: 'compose' is not a docker command.\n"
             "Location of client config files (default \"/home/private-user/.docker\")\n"
         )
 
         def fake_run(*args, **kwargs):
-            raise self.chamosel.subprocess.CalledProcessError(125, args[0], stderr=leaked_help)
+            return self.chamosel.subprocess.CompletedProcess(args[0], 125, stderr=leaked_help)
 
         self.chamosel.subprocess.run = fake_run
 
@@ -302,6 +302,22 @@ class GenerateTests(unittest.TestCase):
         rendered_logs = "\n".join(logs.output)
         self.assertIn("Docker Compose v2 plugin is not available", rendered_logs)
         self.assertNotIn("/home/private-user", rendered_logs)
+
+    def test_compose_cmd_streams_docker_output_when_not_capturing(self):
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append((cmd, kwargs))
+            return self.chamosel.subprocess.CompletedProcess(cmd, 0, stdout="ok\n")
+
+        self.chamosel.subprocess.run = fake_run
+
+        self.chamosel.compose_cmd(["pull", "--ignore-buildable"])
+
+        self.assertEqual(["docker", "compose", "version"], calls[0][0])
+        self.assertTrue(calls[0][1]["capture_output"])
+        self.assertEqual(["docker", "compose", "-f", "docker-compose.yml", "pull", "--ignore-buildable"], calls[1][0])
+        self.assertFalse(calls[1][1]["capture_output"])
 
     def test_env_file_and_config_key_conflict_fails(self):
         Path(".env").write_text("GLUETUN_API_KEY=other-secret\n")
