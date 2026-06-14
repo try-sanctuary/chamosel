@@ -1,5 +1,5 @@
 global_settings:
-  proxy_port: 8888          # scrapers point here
+  proxy_port: 8888          # request clients point here
   api_bind: 127.0.0.1       # controller API/dashboard host bind; use 0.0.0.0 only behind firewall/auth
   stats_port: 8404          # HAProxy stats UI at /stats
   stats_bind: 127.0.0.1     # stats host bind; keep local by default on VPS

@@ -89,7 +89,7 @@ tests/
 └── test_controller.py       # controller state, health, polling, rotation outcome tests
 README.md                   # operator docs and safe exposure notes
 config.yml.example          # safe defaults and explicit opt-in settings
-examples/client.php         # scraper-facing example, unchanged unless response contract docs need update
+examples/client.php         # request-facing example, unchanged unless response contract docs need update
 ```
 
 **Structure Decision**: Keep the existing single-project layout and add a small

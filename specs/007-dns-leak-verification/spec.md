@@ -12,7 +12,7 @@
 
 ### User Story 1 - Verify Backend DNS Resolvers (Priority: P1)
 
-As an operator, I want to run a DNS leak check for every healthy backend in the pool, so that I can see which DNS resolvers are observed for each backend before trusting scraper traffic.
+As an operator, I want to run a DNS leak check for every healthy backend in the pool, so that I can see which DNS resolvers are observed for each backend before trusting request traffic.
 
 **Why this priority**: The project already verifies proxy exit IPs, but DNS resolver visibility is a separate leak class. Operators need this signal before live use.
 

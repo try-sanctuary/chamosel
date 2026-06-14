@@ -83,7 +83,7 @@ settles to accurate health and error state within the expected polling window.
 
 ### User Story 3 - Rotation Results Match Operator Reality (Priority: P3)
 
-As an operator or scraper client responding to bans, I want rotation responses
+As an operator or request client responding to bans, I want rotation responses
 and counters to indicate whether a backend actually recovered, so that I do not
 mistake a command acknowledgement for a usable fresh exit path.
 
@@ -122,7 +122,7 @@ verify the reported result, counters, and pool state match each outcome.
 - A rotation command succeeds at the control-command layer but the tunnel never
   returns to usable health.
 - A pool has a single instance, so rotation and cooldown behavior directly affect
-  all scraper traffic.
+  all request traffic.
 
 ## Requirements *(mandatory)*
 
@@ -216,7 +216,7 @@ verify the reported result, counters, and pool state match each outcome.
 - Operators who need remote dashboard, metrics, or stats access can place those
   endpoints behind their own authenticated reverse proxy or firewall.
 - The feature covers configuration generation, controller behavior, operator
-  state, and documentation for the listed risks; it does not add a new scraper
+  state, and documentation for the listed risks; it does not add a new request
   client feature.
 - The default bounded recovery wait for rotation success is 30 seconds.
 - Live VPN credentials may not be available in every development environment, so

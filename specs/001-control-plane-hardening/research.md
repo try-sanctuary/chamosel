@@ -83,14 +83,14 @@ within that window; otherwise record a distinct recovery timeout outcome.
 
 **Rationale**: Operators need counters to reflect usable proxy capacity, not just
 command acknowledgement. The 30-second window was clarified in the spec and is
-long enough for ordinary tunnel recovery without hanging scraper retry workflows
+long enough for ordinary tunnel recovery without hanging request retry workflows
 indefinitely.
 
 **Alternatives considered**:
 - Count success immediately: current optimistic behavior.
 - Return pending and let polling update counters later: more complex state
   lifecycle and less clear synchronous feedback.
-- Wait 60 seconds: safer for slow VPNs, but too slow for scraper retry loops.
+- Wait 60 seconds: safer for slow VPNs, but too slow for request retry loops.
 
 ## Testing Strategy
 
