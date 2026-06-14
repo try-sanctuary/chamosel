@@ -247,13 +247,23 @@ def controller_auth_enabled(cfg: dict) -> bool:
     return truthy(gset(cfg, "controller_auth_enabled"))
 
 
+def controller_auth_secret_file_paths(cfg: dict, env_path: str = ENV_FILE) -> list[str]:
+    configured_env_file = str(gset(cfg, "env_file") or "").strip()
+    paths: list[str] = []
+    for path in (configured_env_file, ".env.local", env_path):
+        if path and path not in paths:
+            paths.append(path)
+    return paths
+
+
 def read_controller_auth_token(cfg: dict, env_path: str = ENV_FILE) -> str:
     env_token = os.environ.get("CONTROLLER_AUTH_TOKEN", "").strip()
     if env_token:
         return env_token
-    file_token = read_env_value("CONTROLLER_AUTH_TOKEN", env_path)
-    if file_token:
-        return file_token
+    for path in controller_auth_secret_file_paths(cfg, env_path):
+        file_token = read_env_value("CONTROLLER_AUTH_TOKEN", path)
+        if file_token:
+            return file_token
     return str(cfg.get("global_settings", {}).get("controller_auth_token") or "").strip()
 
 
@@ -263,10 +273,30 @@ def resolve_controller_auth_info(cfg: dict, env_path: str = ENV_FILE) -> ApiKeyR
         return ApiKeyResolution("", "disabled")
 
     env_token = os.environ.get("CONTROLLER_AUTH_TOKEN", "").strip()
-    file_token = read_env_value("CONTROLLER_AUTH_TOKEN", env_path)
     cfg_token = str(cfg.get("global_settings", {}).get("controller_auth_token") or "").strip()
+    secret_file_tokens = []
+    for path in controller_auth_secret_file_paths(cfg, env_path):
+        token = read_env_value("CONTROLLER_AUTH_TOKEN", path)
+        if token:
+            secret_file_tokens.append((path, token))
 
-    if file_token and cfg_token and file_token != cfg_token:
+    user_secret_tokens = [(path, token) for path, token in secret_file_tokens if path != env_path]
+    distinct_user_secret_tokens = {token for _, token in user_secret_tokens}
+    generated_file_token = read_env_value("CONTROLLER_AUTH_TOKEN", env_path)
+
+    if len(distinct_user_secret_tokens) > 1:
+        log.error(
+            "Conflicting CONTROLLER_AUTH_TOKEN values in controller auth secret files; "
+            "remove duplicates or make them identical."
+        )
+        sys.exit(1)
+    if distinct_user_secret_tokens and cfg_token and next(iter(distinct_user_secret_tokens)) != cfg_token:
+        log.error(
+            "Conflicting CONTROLLER_AUTH_TOKEN values in controller auth secret file and "
+            "global_settings.controller_auth_token; remove one or make them identical."
+        )
+        sys.exit(1)
+    if generated_file_token and cfg_token and generated_file_token != cfg_token and not distinct_user_secret_tokens:
         log.error(
             "Conflicting CONTROLLER_AUTH_TOKEN values in %s and global_settings.controller_auth_token; "
             "remove one or make them identical.",
@@ -275,8 +305,13 @@ def resolve_controller_auth_info(cfg: dict, env_path: str = ENV_FILE) -> ApiKeyR
         sys.exit(1)
     if env_token:
         return ApiKeyResolution(env_token, "environment")
-    if file_token:
-        return ApiKeyResolution(file_token, env_path)
+    if distinct_user_secret_tokens:
+        token = next(iter(distinct_user_secret_tokens))
+        write_env_value("CONTROLLER_AUTH_TOKEN", token, env_path)
+        source = next(path for path, value in user_secret_tokens if value == token)
+        return ApiKeyResolution(token, source)
+    if generated_file_token:
+        return ApiKeyResolution(generated_file_token, env_path)
     if cfg_token:
         write_env_value("CONTROLLER_AUTH_TOKEN", cfg_token, env_path)
         return ApiKeyResolution(cfg_token, "config")

@@ -29,8 +29,14 @@ request client ──http_proxy──> HAProxy :8888 ──tcp──> gluetun_0 
 ## Quick start
 
 ```bash
+python3 --version                  # must be Python 3.10+
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install -r requirements.txt
+
 cp config.yml.example config.yml   # add your VPN credentials
-python3 chamosel.py up             # generate configs, pull latest images, compose up
+python chamosel.py up              # generate configs, pull latest images, compose up
 
 # Proxy:     http://localhost:8888
 # Dashboard: http://localhost:8800       # bound to 127.0.0.1 by default
@@ -39,6 +45,15 @@ python3 chamosel.py up             # generate configs, pull latest images, compo
 
 curl -x http://localhost:8888 https://ipinfo.io/ip
 ```
+
+If `python3 chamosel.py up` fails with `ModuleNotFoundError: No module named 'dataclasses'`,
+your `python3` is older than the supported runtime. Use Python 3.10 or newer and run the CLI
+from the virtual environment above.
+
+If dependency installation fails with `No matching distribution found for jinja2>=3.1` or shows
+an old pip such as `pip 9.x`, the virtual environment was created with an unsupported Python or
+an outdated packaging toolchain. Check `.venv/bin/python --version`; if it is below 3.10, install
+a newer Python, delete `.venv`, and recreate it with that interpreter.
 
 ## CLI
 
@@ -215,7 +230,7 @@ global_settings:
   # dns_upstream_resolvers: ""     # named gluetun DoT/DoH resolvers, e.g. "cloudflare,quad9"
   # dns_upstream_plain_addresses: "" # provider DNS ip:port list from provider config
   controller_auth_enabled: false
-  # controller_auth_token: "" # optional; generated into .env when controller auth is enabled
+  # controller_auth_token: "" # optional fallback; prefer CONTROLLER_AUTH_TOKEN in .env.local
   poll_interval: 15          # background health/IP poll interval
   # api_key: ""              # optional local gluetun control-server key
 
@@ -246,17 +261,18 @@ $res = $client->fetchWithRetry('https://example.com/products');
 - **After rotation:** the controller waits up to `rotation_recovery_timeout` seconds for a healthy tunnel and changed public IP. If recovery times out, `/rotate` returns `ok: false` with outcome `recovery_timeout` and starts a cooldown for mass/automatic rotation. If the tunnel is healthy but the IP did not change, the outcome is `healthy_ip_unchanged`.
 - **Verified egress IP:** `/pool?fresh=1` verifies each healthy backend by requesting `egress_verify_target` through that backend's HTTP proxy and caches the resulting `verified_proxy_ip` for `egress_verify_ttl` seconds. Diversity checks prefer fresh verified proxy IPs over gluetun's `/v1/publicip/ip` value. A `public_ip_mismatch` is visible degraded state, but not an automatic repair trigger by itself.
 - **DNS upstream policy:** by default chamosel does not render gluetun DNS upstream env vars, so gluetun keeps its default Cloudflare DNS-over-TLS resolver. Set `dns_upstream_resolvers` only for named encrypted upstreams supported by gluetun. Set `dns_upstream_plain_addresses` only when you intentionally want provider DNS addresses such as those from a Surfshark manual config; this switches generated gluetun services to plain upstream DNS.
-- **Controller auth:** `controller_auth_enabled: true` protects the dashboard, `/pool`, `/metrics`, `/rotate*`, and `/repair/duplicate-ip` with `X-Chamosel-Auth`. The CLI reads `CONTROLLER_AUTH_TOKEN` from the environment, `.env`, or `global_settings.controller_auth_token` and sends the header automatically. `/health` remains public for liveness checks. If `api_bind` is not loopback, generation fails unless controller auth is enabled.
+- **Controller auth:** `controller_auth_enabled: true` protects the dashboard, `/pool`, `/metrics`, `/rotate*`, and `/repair/duplicate-ip` with `X-Chamosel-Auth`. The CLI reads `CONTROLLER_AUTH_TOKEN` from the environment, `global_settings.env_file` such as `.env.local`, generated `.env`, or `global_settings.controller_auth_token` and sends the header automatically. `/health` remains public for liveness checks. If `api_bind` is not loopback, generation fails unless controller auth is enabled.
 - **Pool status:** `/pool`, `/metrics`, `status`, and the dashboard expose `pool_status` as `healthy`, `degraded`, or `down`. The pool is degraded when state is stale after controller restart, too few backends are healthy, duplicate verified proxy IPs or fallback public IPs are detected, egress verification fails, public IP differs from verified proxy IP, or recent rotation recovery/proxy checks failed. With `auto_repair_duplicate_ips: true`, duplicate-IP detection after polling or `/pool?fresh=1` schedules one non-forced background rotation for a duplicate backend, respecting cooldown and `duplicate_repair_retry_cooldown`. Duplicate repair treats a fresh verified proxy IP that has moved away from the duplicate as recovered, even if gluetun's control API public IP remains mismatched.
 - **Known behavior: degraded and IP mismatch:** gluetun's control API `public_ip` and the actual HTTP proxy `verified_proxy_ip` can temporarily or persistently differ. chamosel uses fresh `verified_proxy_ip` as the source of truth for request egress diversity and duplicate repair. The pool may still show `degraded` with `public_ip_mismatch` so operators can see the discrepancy; this is monitor-only unless verified proxy IPs are duplicated, egress verification fails, or another fail-level reason is present.
 - **Mass rotation:** `/rotate/all` rotates eligible backends in batches. The defaults are `rotate_all_batch_size: 2` and `rotate_all_batch_delay_seconds: 2`; keep `rotate_cooldown > 0` for live providers so repeated recovery failures back off instead of hammering the same account.
 - **Control API key:** `api_key` is not a paid gluetun key and not a provider subscription key. It is a local secret shared between gluetun's control server and the chamosel controller. If you set it in `config.yml`, `generate` writes the same value to `.env` so Docker Compose can pass it to the controller. If `.env` and `config.yml` disagree, generation fails instead of creating a split-brain auth setup.
-- **Controller auth token:** `controller_auth_token` is separate from `api_key`. It is the operator-facing chamosel controller token, not a gluetun/provider key. When auth is enabled and no token is configured, `generate` creates one in `.env`.
+- **Controller auth token:** `controller_auth_token` is separate from `api_key`. It is the operator-facing chamosel controller token, not a gluetun/provider key. Prefer keeping it in `.env.local` as `CONTROLLER_AUTH_TOKEN=...` while setting `controller_auth_enabled: true` in `config.yml`; `generate` copies that value into generated `.env` so Docker Compose can interpolate it for the controller. When auth is enabled and no token is configured, `generate` creates one in `.env`.
 - **Provider secrets:** keep VPN credentials out of `config.yml` when possible. Copy `.env.example` to `.env.local`, set `global_settings.env_file: .env.local`, and put values such as `WIREGUARD_PRIVATE_KEY` there. `.env.local` is ignored by Git.
 - **Image freshness:** `chamosel.py up` runs `docker compose pull --ignore-buildable` before starting the stack so runtime images such as gluetun do not silently stay stale. Use `chamosel.py up --no-pull` when you intentionally want to use only local cached images.
 - **Surfshark:** start live validation around `num_containers: 5` and increase carefully. Frequent `rotate/all` can run into provider recovery delays even when leak-only verification is stable.
 - **API/dashboard exposure:** ports `8800` and `8404` bind to localhost by default. If you set `api_bind` to `0.0.0.0`, enable `controller_auth_enabled: true`; keep firewall/reverse-proxy controls in front of any public host bind. HAProxy stats still needs network-level protection if `stats_bind` is public.
 - **Docker volumes:** `chamosel.py down` preserves volumes (gluetun servers cache + state). Use `docker compose down -v` to wipe everything.
+- **Python runtime:** `dataclasses` is part of Python's standard library in supported Python versions. If it is missing, the host is running an old Python interpreter; install Python 3.10+ and use a virtual environment.
 
 ## Requirements
 

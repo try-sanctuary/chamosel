@@ -122,6 +122,42 @@ class GenerateTests(unittest.TestCase):
         self.assertIn("0.0.0.0:8800:8800/tcp", compose["services"]["controller"]["ports"])
         self.assertIn("0.0.0.0:8404:8404/tcp", compose["services"]["haproxy"]["ports"])
 
+    def test_controller_auth_token_can_come_from_env_local(self):
+        cfg = self.base_config()
+        cfg["global_settings"]["api_bind"] = "0.0.0.0"
+        cfg["global_settings"]["controller_auth_enabled"] = True
+        cfg["global_settings"]["env_file"] = ".env.local"
+        Path(".env.local").write_text("CONTROLLER_AUTH_TOKEN=local-controller-secret\n")
+
+        self.chamosel.generate(cfg)
+        compose = yaml.safe_load(Path("docker-compose.yml").read_text())
+
+        env_text = Path(".env").read_text()
+        controller_env = compose["services"]["controller"]["environment"]
+        self.assertIn("CONTROLLER_AUTH_TOKEN=local-controller-secret\n", env_text)
+        self.assertEqual("true", controller_env["CONTROLLER_AUTH_ENABLED"])
+        self.assertEqual("${CONTROLLER_AUTH_TOKEN}", controller_env["CONTROLLER_AUTH_TOKEN"])
+        self.assertEqual(
+            {"X-Chamosel-Auth": "local-controller-secret"},
+            self.chamosel.controller_auth_headers(cfg),
+        )
+
+    def test_controller_auth_env_local_and_config_conflict_fails(self):
+        cfg = self.base_config()
+        cfg["global_settings"]["api_bind"] = "0.0.0.0"
+        cfg["global_settings"]["controller_auth_enabled"] = True
+        cfg["global_settings"]["env_file"] = ".env.local"
+        cfg["global_settings"]["controller_auth_token"] = "config-controller-secret"
+        Path(".env.local").write_text("CONTROLLER_AUTH_TOKEN=local-controller-secret\n")
+
+        with self.assertLogs("chamosel", level="ERROR") as logs:
+            with self.assertRaises(SystemExit):
+                self.chamosel.generate(cfg)
+
+        rendered_logs = "\n".join(logs.output)
+        self.assertNotIn("local-controller-secret", rendered_logs)
+        self.assertNotIn("config-controller-secret", rendered_logs)
+
     def test_provider_env_file_renders_when_configured(self):
         cfg = self.base_config()
         cfg["global_settings"]["env_file"] = ".env.local"
