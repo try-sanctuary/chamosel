@@ -10,7 +10,7 @@ ports:
   - "127.0.0.1:${stats_port}:${stats_port}/tcp"
 ```
 
-The scraper proxy port keeps existing proxy-facing behavior unless the
+The request proxy port keeps existing proxy-facing behavior unless the
 implementation adds an explicit bind option outside this feature's requirements.
 
 ## Service Environment

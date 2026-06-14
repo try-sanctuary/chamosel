@@ -35,7 +35,7 @@ dashboard, or HAProxy stats.
 **Validation rules**:
 - `controller` and `stats` default to `127.0.0.1`.
 - Remote exposure requires an explicit config value and documentation warning.
-- `proxy` remains scraper-facing and may bind according to existing proxy
+- `proxy` remains request-facing and may bind according to existing proxy
   behavior.
 
 ## Provider Environment Entry

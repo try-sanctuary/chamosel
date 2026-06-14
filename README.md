@@ -2,17 +2,17 @@
 
 > *Spin the wheel. Change the skin.*
 
-A rotating VPN exit-IP pool orchestrator built for scrapers. Runs N [gluetun](https://github.com/qdm12/gluetun) VPN containers behind a single HAProxy endpoint, plus a **controller** that exposes a REST API, Prometheus metrics and a live dashboard — and performs **graceful IP rotation** without restarting containers.
+A rotating VPN exit-IP pool orchestrator built for outbound requests. Runs N [gluetun](https://github.com/qdm12/gluetun) VPN containers behind a single HAProxy endpoint, plus a **controller** that exposes a REST API, Prometheus metrics and a live dashboard — and performs **graceful IP rotation** without restarting containers.
 
-Point your scraper at one proxy port. Get blocked? `POST /rotate` (or let the PHP client do it automatically) and you're on a fresh exit IP within seconds.
+Point your HTTP client at one proxy port. Get blocked? `POST /rotate` (or let the PHP client do it automatically) and you're on a fresh exit IP within seconds.
 
 ```
-scraper ──http_proxy──> HAProxy :8888 ──tcp──> gluetun_0 ── exit IP #1
-   │                                     ├────> gluetun_1 ── exit IP #2
-   │                                     ├────> gluetun_2 ── exit IP #3
-   │                                     └────> gluetun_3 ── exit IP #4
-   │                                              ▲ control server :8000 (apikey auth)
-   └── POST /rotate · GET /metrics ──> chamosel-ctrl :8800 ─┘
+request client ──http_proxy──> HAProxy :8888 ──tcp──> gluetun_0 ── exit IP #1
+          │                                     ├────> gluetun_1 ── exit IP #2
+          │                                     ├────> gluetun_2 ── exit IP #3
+          │                                     └────> gluetun_3 ── exit IP #4
+          │                                              ▲ control server :8000 (apikey auth)
+          └── POST /rotate · GET /metrics ──> chamosel-ctrl :8800 ─┘
 ```
 
 ## Features
@@ -248,6 +248,7 @@ $res = $client->fetchWithRetry('https://example.com/products');
 - **DNS upstream policy:** by default chamosel does not render gluetun DNS upstream env vars, so gluetun keeps its default Cloudflare DNS-over-TLS resolver. Set `dns_upstream_resolvers` only for named encrypted upstreams supported by gluetun. Set `dns_upstream_plain_addresses` only when you intentionally want provider DNS addresses such as those from a Surfshark manual config; this switches generated gluetun services to plain upstream DNS.
 - **Controller auth:** `controller_auth_enabled: true` protects the dashboard, `/pool`, `/metrics`, `/rotate*`, and `/repair/duplicate-ip` with `X-Chamosel-Auth`. The CLI reads `CONTROLLER_AUTH_TOKEN` from the environment, `.env`, or `global_settings.controller_auth_token` and sends the header automatically. `/health` remains public for liveness checks. If `api_bind` is not loopback, generation fails unless controller auth is enabled.
 - **Pool status:** `/pool`, `/metrics`, `status`, and the dashboard expose `pool_status` as `healthy`, `degraded`, or `down`. The pool is degraded when state is stale after controller restart, too few backends are healthy, duplicate verified proxy IPs or fallback public IPs are detected, egress verification fails, public IP differs from verified proxy IP, or recent rotation recovery/proxy checks failed. With `auto_repair_duplicate_ips: true`, duplicate-IP detection after polling or `/pool?fresh=1` schedules one non-forced background rotation for a duplicate backend, respecting cooldown and `duplicate_repair_retry_cooldown`. Duplicate repair treats a fresh verified proxy IP that has moved away from the duplicate as recovered, even if gluetun's control API public IP remains mismatched.
+- **Known behavior: degraded and IP mismatch:** gluetun's control API `public_ip` and the actual HTTP proxy `verified_proxy_ip` can temporarily or persistently differ. chamosel uses fresh `verified_proxy_ip` as the source of truth for request egress diversity and duplicate repair. The pool may still show `degraded` with `public_ip_mismatch` so operators can see the discrepancy; this is monitor-only unless verified proxy IPs are duplicated, egress verification fails, or another fail-level reason is present.
 - **Mass rotation:** `/rotate/all` rotates eligible backends in batches. The defaults are `rotate_all_batch_size: 2` and `rotate_all_batch_delay_seconds: 2`; keep `rotate_cooldown > 0` for live providers so repeated recovery failures back off instead of hammering the same account.
 - **Control API key:** `api_key` is not a paid gluetun key and not a provider subscription key. It is a local secret shared between gluetun's control server and the chamosel controller. If you set it in `config.yml`, `generate` writes the same value to `.env` so Docker Compose can pass it to the controller. If `.env` and `config.yml` disagree, generation fails instead of creating a split-brain auth setup.
 - **Controller auth token:** `controller_auth_token` is separate from `api_key`. It is the operator-facing chamosel controller token, not a gluetun/provider key. When auth is enabled and no token is configured, `generate` creates one in `.env`.
