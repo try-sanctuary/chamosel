@@ -720,7 +720,7 @@ def select_duplicate_repair_candidate(snap: dict) -> tuple[str | None, str | Non
 def duplicate_repair_worker(instance: str, duplicate_ip: str):
     try:
         log(f"duplicate-egress repair: rotating {instance} from duplicated IP {duplicate_ip}")
-        result = rotate_instance(instance, force=False)
+        result = rotate_instance(instance, force=False, repair_duplicate_ip=duplicate_ip)
         log(f"duplicate-egress repair result: {result}")
         with DUPLICATE_REPAIR_LOCK:
             if result.get("ok"):
@@ -792,7 +792,7 @@ def repair_duplicate_ip_once() -> dict:
 
     result = None
     try:
-        result = rotate_instance(instance, force=False)
+        result = rotate_instance(instance, force=False, repair_duplicate_ip=duplicate_ip)
         with DUPLICATE_REPAIR_LOCK:
             if result.get("ok"):
                 DUPLICATE_REPAIR_BACKOFF_UNTIL.pop(instance, None)
@@ -865,26 +865,49 @@ def verify_proxy_after_rotation(instance: str) -> tuple[bool, str | None]:
     return True, None
 
 
-def wait_for_recovery(instance: str, old_ip, timeout: int = ROTATION_RECOVERY_TIMEOUT) -> tuple[str, str | None, str | None]:
+def wait_for_recovery(
+    instance: str,
+    old_ip,
+    timeout: int = ROTATION_RECOVERY_TIMEOUT,
+    repair_duplicate_ip: str | None = None,
+) -> tuple[str, str | None, str | None, str | None]:
     deadline = time.time() + timeout
+    last_new_ip = None
+    last_verified_ip = None
     while time.time() < deadline:
         h = is_healthy(instance)
         if h:
             new_ip = get_public_ip(instance)
-            if new_ip and new_ip != old_ip:
+            if new_ip:
+                last_new_ip = new_ip
                 STATE.update_health(instance, True, new_ip, status=STATUS_HEALTHY)
+            if repair_duplicate_ip:
                 proxy_ok, proxy_error = verify_proxy_after_rotation(instance)
                 if not proxy_ok:
-                    return OUTCOME_PROXY_FAILURE, new_ip, proxy_error
+                    return OUTCOME_PROXY_FAILURE, new_ip, last_verified_ip, proxy_error
                 verified = refresh_verified_proxy_ip(instance, force=True)
+                last_verified_ip = verified.get("verified_proxy_ip")
                 if verified.get("error"):
-                    return OUTCOME_PROXY_FAILURE, new_ip, verified.get("error")
-                return OUTCOME_SUCCESS, new_ip, None
+                    return OUTCOME_PROXY_FAILURE, new_ip, last_verified_ip, verified.get("error")
+                if last_verified_ip and last_verified_ip != repair_duplicate_ip:
+                    return OUTCOME_SUCCESS, new_ip, last_verified_ip, None
+                if new_ip and new_ip != repair_duplicate_ip:
+                    return OUTCOME_SUCCESS, new_ip, last_verified_ip, None
+                sleep(1)
+                continue
+            if new_ip and new_ip != old_ip:
+                proxy_ok, proxy_error = verify_proxy_after_rotation(instance)
+                if not proxy_ok:
+                    return OUTCOME_PROXY_FAILURE, new_ip, last_verified_ip, proxy_error
+                verified = refresh_verified_proxy_ip(instance, force=True)
+                last_verified_ip = verified.get("verified_proxy_ip")
+                if verified.get("error"):
+                    return OUTCOME_PROXY_FAILURE, new_ip, last_verified_ip, verified.get("error")
+                return OUTCOME_SUCCESS, new_ip, last_verified_ip, None
             if new_ip and old_ip and new_ip == old_ip:
-                STATE.update_health(instance, True, new_ip, status=STATUS_HEALTHY)
-                return OUTCOME_HEALTHY_IP_UNCHANGED, new_ip, None
+                return OUTCOME_HEALTHY_IP_UNCHANGED, new_ip, last_verified_ip, None
         sleep(1)
-    return OUTCOME_RECOVERY_TIMEOUT, None, None
+    return OUTCOME_RECOVERY_TIMEOUT, last_new_ip, last_verified_ip, None
 
 
 def rotation_response(instance: str | None, ok: bool, outcome: str, started_at: float, **extra) -> dict:
@@ -917,7 +940,7 @@ def skipped_cooldown_response(instance: str, started_at: float, bypassed: bool =
     )
 
 
-def rotate_instance(instance: str, force: bool = False) -> dict:
+def rotate_instance(instance: str, force: bool = False, repair_duplicate_ip: str | None = None) -> dict:
     """Graceful rotation: PUT status stopped, then running. New server, no
     container restart. HAProxy drops the instance via health checks while it
     reconnects and re-adds it on recovery."""
@@ -952,7 +975,11 @@ def rotate_instance(instance: str, force: bool = False) -> dict:
                                  old_ip=old_ip, message=str(e),
                                  forced_bypass=forced_bypass)
     STATE.update_health(instance, False, old_ip, status=STATUS_RECONNECTING)
-    outcome, new_ip, recovery_error = wait_for_recovery(instance, old_ip)
+    outcome, new_ip, verified_ip, recovery_error = wait_for_recovery(
+        instance,
+        old_ip,
+        repair_duplicate_ip=repair_duplicate_ip,
+    )
     if outcome != OUTCOME_SUCCESS:
         if outcome in (OUTCOME_RECOVERY_TIMEOUT, OUTCOME_PROXY_FAILURE):
             STATE.start_cooldown(instance, outcome)
@@ -969,15 +996,22 @@ def rotate_instance(instance: str, force: bool = False) -> dict:
             started_at,
             old_ip=old_ip,
             new_ip=new_ip,
+            verified_proxy_ip=verified_ip,
+            repair_duplicate_ip=repair_duplicate_ip,
             message=message,
             forced_bypass=forced_bypass,
             **STATE.cooldown_info(instance),
         )
-    message = "rotation recovered with a changed public IP"
+    if repair_duplicate_ip and verified_ip and verified_ip != repair_duplicate_ip:
+        message = "rotation recovered with a changed verified proxy IP"
+    else:
+        message = "rotation recovered with a changed public IP"
     STATE.record_rotation(instance, OUTCOME_SUCCESS, message=message, old_ip=old_ip, new_ip=new_ip)
     log(f"rotated {instance} ({old_ip} -> {new_ip})")
     return rotation_response(instance, True, OUTCOME_SUCCESS, started_at,
                              old_ip=old_ip, new_ip=new_ip,
+                             verified_proxy_ip=verified_ip,
+                             repair_duplicate_ip=repair_duplicate_ip,
                              message=message,
                              forced_bypass=forced_bypass,
                              **STATE.cooldown_info(instance))

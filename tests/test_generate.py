@@ -134,6 +134,40 @@ class GenerateTests(unittest.TestCase):
         self.assertEqual([".env.local"], service["env_file"])
         self.assertNotIn("WIREGUARD_PRIVATE_KEY", service["environment"])
 
+    def test_gluetun_dns_upstream_overrides_are_opt_in(self):
+        self.chamosel.generate(self.base_config())
+        compose = yaml.safe_load(Path("docker-compose.yml").read_text())
+        env = compose["services"]["surfshark_0"]["environment"]
+
+        self.assertNotIn("DNS_UPSTREAM_RESOLVER_TYPE", env)
+        self.assertNotIn("DNS_UPSTREAM_RESOLVERS", env)
+        self.assertNotIn("DNS_UPSTREAM_PLAIN_ADDRESSES", env)
+
+    def test_gluetun_dns_upstream_overrides_render_when_configured(self):
+        cfg = self.base_config()
+        cfg["global_settings"]["dns_upstream_resolvers"] = "quad9,cloudflare"
+        cfg["global_settings"]["dns_upstream_resolver_type"] = "dot"
+
+        self.chamosel.generate(cfg)
+        compose = yaml.safe_load(Path("docker-compose.yml").read_text())
+        env = compose["services"]["surfshark_0"]["environment"]
+
+        self.assertEqual("dot", env["DNS_UPSTREAM_RESOLVER_TYPE"])
+        self.assertEqual("quad9,cloudflare", env["DNS_UPSTREAM_RESOLVERS"])
+        self.assertNotIn("DNS_UPSTREAM_PLAIN_ADDRESSES", env)
+
+    def test_provider_plain_dns_sets_plain_resolver_type(self):
+        cfg = self.base_config()
+        cfg["global_settings"]["dns_upstream_plain_addresses"] = "10.14.0.1:53"
+
+        self.chamosel.generate(cfg)
+        compose = yaml.safe_load(Path("docker-compose.yml").read_text())
+        env = compose["services"]["surfshark_0"]["environment"]
+
+        self.assertEqual("plain", env["DNS_UPSTREAM_RESOLVER_TYPE"])
+        self.assertEqual("10.14.0.1:53", env["DNS_UPSTREAM_PLAIN_ADDRESSES"])
+        self.assertNotIn("DNS_UPSTREAM_RESOLVERS", env)
+
     def test_controller_reliability_settings_render(self):
         cfg = self.base_config()
         cfg["global_settings"]["rotate_all_batch_size"] = 3

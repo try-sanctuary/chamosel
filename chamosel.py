@@ -19,6 +19,7 @@ Usage:
     chamosel.py down              # docker compose down
     chamosel.py status            # call controller /pool for live status
     chamosel.py rotate [name|all] # ask the controller to rotate
+    chamosel.py verify-dns        # check backend DNS resolver leak signals
 """
 
 import argparse
@@ -43,6 +44,9 @@ COMPOSE_FILE = "docker-compose.yml"
 HAPROXY_FILE = "haproxy.cfg"
 ENV_FILE = ".env"
 DEFAULT_LEAK_TARGET = "https://ifconfig.co/json"
+DEFAULT_DNS_LEAK_SERVICE = "bash.ws"
+DEFAULT_DNS_LEAK_QUERIES = 10
+DEFAULT_DNS_VERIFICATION_POLICY = "external-ok"
 DEFAULT_LEAK_TIMEOUT = 30
 DEFAULT_STRESS_ITERATIONS = 100
 
@@ -74,6 +78,9 @@ DEFAULTS = {
     "egress_verify_timeout": 10,
     "egress_verify_ttl": 120,
     "egress_verify_on_fresh": True,
+    "dns_upstream_resolver_type": "",
+    "dns_upstream_resolvers": "",
+    "dns_upstream_plain_addresses": "",
     "controller_auth_enabled": False,
     "controller_auth_token": "",
     "poll_interval": 15,
@@ -129,11 +136,31 @@ def iter_instances(cfg: dict):
             yield f"{pkey}_{i}", pkey, prov
 
 
-def env_for(pkey: str, prov: dict) -> dict:
+def gluetun_dns_env_overrides(cfg: dict) -> dict:
+    """Optional gluetun DNS upstream overrides; empty values keep gluetun defaults."""
+    resolver_type = str(gset(cfg, "dns_upstream_resolver_type") or "").strip()
+    resolvers = str(gset(cfg, "dns_upstream_resolvers") or "").strip()
+    plain_addresses = str(gset(cfg, "dns_upstream_plain_addresses") or "").strip()
+
+    out = {}
+    if plain_addresses and not resolver_type:
+        resolver_type = "plain"
+    if resolver_type:
+        out["DNS_UPSTREAM_RESOLVER_TYPE"] = resolver_type
+    if resolvers:
+        out["DNS_UPSTREAM_RESOLVERS"] = resolvers
+    if plain_addresses:
+        out["DNS_UPSTREAM_PLAIN_ADDRESSES"] = plain_addresses
+    return out
+
+
+def env_for(pkey: str, prov: dict, global_env: dict | None = None) -> dict:
     name = prov.get("provider_name", pkey.replace("_", " ").lower())
     out = {"VPN_SERVICE_PROVIDER": str(name)}
     for k, v in (prov.get("env") or {}).items():
         out[str(k)] = "" if v is None else str(v)
+    for k, v in (global_env or {}).items():
+        out.setdefault(k, "" if v is None else str(v))
     return out
 
 
@@ -297,8 +324,9 @@ def generate(cfg: dict):
     instances = list(iter_instances(cfg))
     names = [n for n, _, _ in instances]
 
+    gluetun_global_env = gluetun_dns_env_overrides(cfg)
     compose = jinja.get_template("docker-compose.yml.j2").render(
-        instances=[{"name": n, "env": env_for(pk, pv)} for n, pk, pv in instances],
+        instances=[{"name": n, "env": env_for(pk, pv, gluetun_global_env)} for n, pk, pv in instances],
         names=names,
         image=gset(cfg, "image"),
         haproxy_image=gset(cfg, "haproxy_image"),
@@ -497,6 +525,39 @@ except Exception as exc:
 """.strip()
 
 
+DNS_PROBE_SCRIPT = r"""
+import json
+import sys
+import urllib.request
+
+service, proxy, timeout, query_count = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+opener = urllib.request.build_opener(
+    urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+)
+headers = {"user-agent": "chamosel dns leak verifier"}
+
+def read_text(url, request_timeout=timeout):
+    req = urllib.request.Request(url, headers=headers)
+    with opener.open(req, timeout=request_timeout) as resp:
+        return resp.read().decode("utf-8").strip()
+
+try:
+    leak_id = read_text(f"https://{service}/id")
+    trigger_timeout = max(1, min(3, timeout))
+    for idx in range(query_count):
+        try:
+            read_text(f"http://{idx}.{leak_id}.{service}/chamosel-dns-leak-test.png", trigger_timeout)
+        except Exception:
+            pass
+    raw = read_text(f"https://{service}/dnsleak/test/{leak_id}?json")
+    payload = json.loads(raw)
+    print(json.dumps({"ok": True, "payload": payload}, separators=(",", ":")))
+except Exception as exc:
+    print(json.dumps({"ok": False, "error": str(exc)}, separators=(",", ":")))
+    sys.exit(1)
+""".strip()
+
+
 def build_backend_probe_cmd(instance: str, target: str, timeout: int) -> list[str]:
     proxy = f"http://{instance}:{GLUETUN_PROXY_PORT}"
     return [
@@ -513,6 +574,31 @@ def build_backend_probe_cmd(instance: str, target: str, timeout: int) -> list[st
         target,
         proxy,
         str(timeout),
+    ]
+
+
+def build_backend_dns_probe_cmd(
+    instance: str,
+    timeout: int,
+    service: str = DEFAULT_DNS_LEAK_SERVICE,
+    query_count: int = DEFAULT_DNS_LEAK_QUERIES,
+) -> list[str]:
+    proxy = f"http://{instance}:{GLUETUN_PROXY_PORT}"
+    return [
+        "docker",
+        "compose",
+        "-f",
+        COMPOSE_FILE,
+        "exec",
+        "-T",
+        "controller",
+        "python",
+        "-c",
+        DNS_PROBE_SCRIPT,
+        service,
+        proxy,
+        str(timeout),
+        str(query_count),
     ]
 
 
@@ -535,6 +621,30 @@ def run_backend_probe(instance: str, target: str, timeout: int) -> dict:
     if result.returncode != 0 or not data.get("ok"):
         raise LeakVerificationError(data.get("error") or "backend probe failed")
     return data.get("payload") or {}
+
+
+def run_backend_dns_probe(instance: str, timeout: int) -> list[dict]:
+    cmd = build_backend_dns_probe_cmd(instance, timeout)
+    try:
+        result = subprocess.run(cmd, text=True, capture_output=True, check=False, timeout=timeout + 10)
+    except FileNotFoundError:
+        raise LeakVerificationError("docker not found")
+    except subprocess.TimeoutExpired:
+        raise LeakVerificationError("dns probe timed out")
+
+    stdout = (result.stdout or "").strip()
+    if not stdout:
+        raise LeakVerificationError("dns probe returned no output")
+    try:
+        data = json.loads(stdout)
+    except json.JSONDecodeError:
+        raise LeakVerificationError("dns probe returned malformed JSON")
+    if result.returncode != 0 or not data.get("ok"):
+        raise LeakVerificationError(data.get("error") or "dns probe failed")
+    payload = data.get("payload")
+    if not isinstance(payload, list):
+        raise LeakVerificationError("dns probe returned malformed payload")
+    return payload
 
 
 def normalize_probe_result(instance: dict, direct_ip: str, payload: dict, error: str | None = None) -> dict:
@@ -577,6 +687,100 @@ def normalize_probe_result(instance: dict, direct_ip: str, payload: dict, error:
         "asn": metadata.get("asn"),
         "asn_org": metadata.get("asn_org") or metadata.get("asn_org_name"),
         "leak_detected": leak_detected,
+        "error": result_error,
+    }
+
+
+def normalize_dns_server(entry: dict) -> dict | None:
+    ip = str(entry.get("ip") or "").strip()
+    if not ip:
+        return None
+    return {
+        "ip": ip,
+        "country": entry.get("country_name") or entry.get("country"),
+        "asn": entry.get("asn"),
+    }
+
+
+def dns_resolver_risk(ip: str) -> str | None:
+    try:
+        parsed = ipaddress.ip_address(str(ip))
+    except ValueError:
+        return "resolver IP is malformed"
+    if not parsed.is_global:
+        return "resolver IP is not globally routable"
+    return None
+
+
+def normalize_dns_probe_result(
+    instance: dict,
+    payload: list[dict],
+    error: str | None = None,
+    strict_asn: bool = False,
+) -> dict:
+    controller_status = instance.get("status") or ("healthy" if instance.get("healthy") else "down")
+    connection = {}
+    dns_servers = []
+    conclusions = []
+    warnings = []
+    resolver_risks = []
+    result_error = error
+
+    if error is None:
+        if not isinstance(payload, list):
+            result_error = "dns probe returned malformed payload"
+        else:
+            for entry in payload:
+                if not isinstance(entry, dict):
+                    continue
+                kind = entry.get("type")
+                if kind == "ip" and not connection:
+                    connection = entry
+                elif kind == "dns":
+                    server = normalize_dns_server(entry)
+                    if server:
+                        dns_servers.append(server)
+                elif kind == "conclusion" and entry.get("ip"):
+                    conclusions.append(str(entry["ip"]))
+            if not dns_servers:
+                result_error = "no DNS resolvers found"
+
+    for server in dns_servers:
+        risk = dns_resolver_risk(server.get("ip") or "")
+        if risk:
+            resolver_risks.append({"ip": server.get("ip"), "reason": risk})
+
+    connection_asn = connection.get("asn")
+    dns_asns = [s.get("asn") for s in dns_servers if s.get("asn")]
+    asn_match = None
+    if connection_asn and dns_asns:
+        asn_match = all(asn == connection_asn for asn in dns_asns)
+
+    if asn_match is False:
+        warnings.append("resolver ASN differs from connection ASN")
+
+    if resolver_risks and result_error is None:
+        result_error = resolver_risks[0]["reason"]
+    if strict_asn and asn_match is False and result_error is None:
+        result_error = "resolver ASN differs from connection ASN"
+
+    suspected_leak = result_error is not None and bool(dns_servers)
+    dns_ok = result_error is None and bool(dns_servers)
+    return {
+        "name": instance.get("name") or "",
+        "controller_status": controller_status,
+        "healthy": bool(instance.get("healthy")),
+        "connection_ip": connection.get("ip"),
+        "connection_asn": connection_asn,
+        "dns_servers": dns_servers,
+        "resolver_count": len(dns_servers),
+        "asn_match": asn_match,
+        "suspected_leak": suspected_leak,
+        "strict_asn": strict_asn,
+        "warnings": warnings,
+        "resolver_risks": resolver_risks,
+        "dns_ok": dns_ok,
+        "conclusions": conclusions,
         "error": result_error,
     }
 
@@ -635,6 +839,59 @@ def verify_leaks(cfg: dict, target: str = DEFAULT_LEAK_TARGET, timeout: int = DE
     }
 
 
+def verify_dns_leaks(cfg: dict, timeout: int = DEFAULT_LEAK_TIMEOUT, strict_asn: bool = False) -> dict:
+    policy = "strict-asn" if strict_asn else DEFAULT_DNS_VERIFICATION_POLICY
+    try:
+        timeout = validate_timeout(timeout)
+        pool = fetch_pool_state(cfg)
+    except LeakVerificationError as e:
+        return {
+            "ok": False,
+            "target": DEFAULT_DNS_LEAK_SERVICE,
+            "policy": policy,
+            "verified_count": 0,
+            "total_count": 0,
+            "error": str(e),
+            "instances": [],
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "target": DEFAULT_DNS_LEAK_SERVICE,
+            "policy": policy,
+            "verified_count": 0,
+            "total_count": 0,
+            "error": f"dns verification failed: {e}",
+            "instances": [],
+        }
+
+    results = []
+    for instance in pool.get("instances", []):
+        healthy = bool(instance.get("healthy"))
+        status = instance.get("status") or ("healthy" if healthy else "down")
+        if not healthy:
+            results.append(normalize_dns_probe_result(instance, [], f"controller status is {status}", strict_asn=strict_asn))
+            continue
+        try:
+            payload = run_backend_dns_probe(instance.get("name") or "", timeout)
+            results.append(normalize_dns_probe_result(instance, payload, strict_asn=strict_asn))
+        except LeakVerificationError as e:
+            results.append(normalize_dns_probe_result(instance, [], str(e), strict_asn=strict_asn))
+
+    verified_count = sum(1 for item in results if item["dns_ok"])
+    total_count = len(results)
+    ok = total_count > 0 and verified_count == total_count
+    return {
+        "ok": ok,
+        "target": DEFAULT_DNS_LEAK_SERVICE,
+        "policy": policy,
+        "verified_count": verified_count,
+        "total_count": total_count,
+        "error": None if ok else "one or more backends failed DNS leak verification",
+        "instances": results,
+    }
+
+
 def render_leak_table(result: dict) -> str:
     lines = [f"Direct host IP: {result.get('direct_ip') or '-'}", ""]
     lines.append(
@@ -658,6 +915,39 @@ def render_leak_table(result: dict) -> str:
     lines.append("")
     lines.append(f"Verified: {result.get('verified_count', 0)}/{result.get('total_count', 0)} backends")
     lines.append(f"Leak result: {'PASS' if result.get('ok') else 'FAIL'}")
+    return "\n".join(lines)
+
+
+def render_dns_table(result: dict) -> str:
+    lines = [
+        f"DNS leak service: {result.get('target') or '-'}",
+        f"DNS policy: {result.get('policy') or DEFAULT_DNS_VERIFICATION_POLICY}",
+        "",
+    ]
+    lines.append(
+        f"{'INSTANCE':<28} {'STATUS':<16} {'CONNECTION_IP':<16} "
+        f"{'CONN_ASN':<12} {'DNS_COUNT':<9} {'DNS_ASN':<18} RESULT"
+    )
+    for item in result.get("instances", []):
+        dns_asns = sorted({server.get("asn") for server in item.get("dns_servers") or [] if server.get("asn")})
+        warnings = item.get("warnings") or []
+        reason = "ok" if item.get("dns_ok") and not item.get("error") else (item.get("error") or "failed")
+        if item.get("dns_ok") and warnings:
+            reason = "warning: " + "; ".join(warnings)
+        lines.append(
+            f"{item.get('name') or '-':<28} "
+            f"{item.get('controller_status') or '-':<16} "
+            f"{item.get('connection_ip') or '-':<16} "
+            f"{item.get('connection_asn') or '-':<12} "
+            f"{item.get('resolver_count') or 0:<9} "
+            f"{','.join(dns_asns) or '-':<18} "
+            f"{reason}"
+        )
+    if result.get("error") and not result.get("instances"):
+        lines.append(result["error"])
+    lines.append("")
+    lines.append(f"DNS verified: {result.get('verified_count', 0)}/{result.get('total_count', 0)} backends")
+    lines.append(f"DNS leak result: {'PASS' if result.get('ok') else 'FAIL'}")
     return "\n".join(lines)
 
 
@@ -1066,6 +1356,21 @@ def cmd_verify_leaks(cfg, json_output: bool = False, timeout: int = DEFAULT_LEAK
         raise SystemExit(1)
 
 
+def cmd_verify_dns(
+    cfg,
+    json_output: bool = False,
+    timeout: int = DEFAULT_LEAK_TIMEOUT,
+    strict_asn: bool = False,
+):
+    result = verify_dns_leaks(cfg, timeout=timeout, strict_asn=strict_asn)
+    if json_output:
+        print(json.dumps(result, indent=2))
+    else:
+        print(render_dns_table(result))
+    if not result.get("ok"):
+        raise SystemExit(1)
+
+
 def cmd_stress(
     cfg: dict,
     iterations: int = DEFAULT_STRESS_ITERATIONS,
@@ -1109,15 +1414,15 @@ def cmd_doctor(cfg: dict, json_output: bool = False, repair: bool = False):
 
 def build_parser():
     p = argparse.ArgumentParser(description="chamosel - spin the wheel, change the skin")
-    p.add_argument("action", choices=["genkey", "generate", "up", "down", "status", "rotate", "verify-leaks", "stress", "doctor"])
+    p.add_argument("action", choices=["genkey", "generate", "up", "down", "status", "rotate", "verify-leaks", "verify-dns", "stress", "doctor"])
     p.add_argument("rotate_target", nargs="?", help="for rotate: instance name or 'all'")
     p.add_argument("-c", "--config", default=CONFIG_FILE)
     p.add_argument("--no-pull", action="store_true",
                    help="for up: skip docker compose pull and use local images")
     p.add_argument("--json", dest="json_output", action="store_true",
-                   help="for verify-leaks/stress/doctor: output one JSON object")
+                   help="for verify-leaks/verify-dns/stress/doctor: output one JSON object")
     p.add_argument("--timeout", type=int, default=DEFAULT_LEAK_TIMEOUT,
-                   help=f"for verify-leaks: request timeout in seconds (default: {DEFAULT_LEAK_TIMEOUT})")
+                   help=f"for verify-leaks/verify-dns: request timeout in seconds (default: {DEFAULT_LEAK_TIMEOUT})")
     p.add_argument("--target", dest="leak_target", default=DEFAULT_LEAK_TARGET,
                    help=f"for verify-leaks/stress: public-IP JSON target (default: {DEFAULT_LEAK_TARGET})")
     p.add_argument("--iterations", type=int, default=DEFAULT_STRESS_ITERATIONS,
@@ -1130,6 +1435,8 @@ def build_parser():
                    help="for stress --mode rotation: skip verify-leaks after each rotation")
     p.add_argument("--repair", action="store_true",
                    help="for doctor: after diagnosis, request one safe duplicate-IP repair action")
+    p.add_argument("--strict-dns-asn", action="store_true",
+                   help="for verify-dns: fail when resolver ASN differs from backend connection ASN")
     return p
 
 
@@ -1145,6 +1452,7 @@ def main():
     elif a.action == "status": cmd_status(cfg)
     elif a.action == "rotate": cmd_rotate(cfg, a.rotate_target)
     elif a.action == "verify-leaks": cmd_verify_leaks(cfg, a.json_output, a.timeout, a.leak_target)
+    elif a.action == "verify-dns": cmd_verify_dns(cfg, a.json_output, a.timeout, a.strict_dns_asn)
     elif a.action == "stress":
         cmd_stress(
             cfg,
