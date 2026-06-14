@@ -285,7 +285,7 @@ docker network connect chamosel-clients your-client-container
 docker exec your-client-container curl -x http://chamosel-proxy:8890 https://api.ipify.org
 ```
 
-Only `chamosel-haproxy` joins the client network. The controller and gluetun backends stay on the internal pool network, so the client network is for request proxy traffic only. With `proxy_publish: false`, `docker ps` will not show a host mapping for the proxy port; client containers must use the configured network alias instead.
+Only `chamosel-haproxy` joins the client network. The controller and gluetun backends stay on the internal pool network, so the client network is for request proxy traffic only. With `proxy_publish: false`, `docker ps` will not show a host mapping for the proxy port; client containers must use the configured network alias instead. In this mode, `proxy_allowed_cidrs` is not rendered into the proxy frontend because the host proxy port is not published; access is controlled by membership in the shared Docker network.
 
 ## PHP integration
 

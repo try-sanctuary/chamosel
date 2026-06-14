@@ -194,6 +194,18 @@ class GenerateTests(unittest.TestCase):
 
         self.assertNotIn("0.0.0.0:8888:8888/tcp", compose["services"]["haproxy"]["ports"])
 
+    def test_proxy_publish_false_does_not_render_host_proxy_acl(self):
+        cfg = self.base_config()
+        cfg["global_settings"]["proxy_publish"] = False
+        cfg["global_settings"]["proxy_client_network_name"] = "chamosel-clients"
+        cfg["global_settings"]["proxy_allowed_cidrs"] = "10.20.20.0/24"
+
+        self.chamosel.generate(cfg)
+        haproxy = Path("haproxy.cfg").read_text()
+
+        self.assertNotIn("acl allowed_proxy_src", haproxy)
+        self.assertNotIn("tcp-request connection reject unless allowed_proxy_src", haproxy)
+
     def test_public_stats_requires_auth_or_allowlist(self):
         cfg = self.base_config()
         cfg["global_settings"]["stats_bind"] = "0.0.0.0"

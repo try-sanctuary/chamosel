@@ -583,7 +583,11 @@ def generate(cfg: dict):
         balance=gset(cfg, "balance"),
         gluetun_proxy_port=GLUETUN_PROXY_PORT,
         gluetun_health_port=GLUETUN_HEALTH_PORT,
-        proxy_allowed_cidrs=validate_cidrs(gset(cfg, "proxy_allowed_cidrs"), "proxy_allowed_cidrs"),
+        proxy_allowed_cidrs=(
+            validate_cidrs(gset(cfg, "proxy_allowed_cidrs"), "proxy_allowed_cidrs")
+            if truthy(gset(cfg, "proxy_publish"))
+            else []
+        ),
         stats_allowed_cidrs=validate_cidrs(gset(cfg, "stats_allowed_cidrs"), "stats_allowed_cidrs"),
         stats_auth_user=gset(cfg, "stats_auth_user"),
         stats_auth_password=gset(cfg, "stats_auth_password"),
