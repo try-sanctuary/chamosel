@@ -94,6 +94,54 @@ class GenerateTests(unittest.TestCase):
         self.assertIn("127.0.0.1:8888:8888/tcp", compose["services"]["haproxy"]["ports"])
         self.assertIn("127.0.0.1:8800:8800/tcp", compose["services"]["controller"]["ports"])
         self.assertIn("127.0.0.1:8404:8404/tcp", compose["services"]["haproxy"]["ports"])
+        self.assertNotIn("proxy-client-net", compose["networks"])
+        self.assertNotIn("proxy-client-net", compose["services"]["controller"]["networks"])
+        self.assertNotIn("proxy-client-net", compose["services"]["surfshark_0"]["networks"])
+
+    def test_proxy_client_network_attaches_only_haproxy_with_alias(self):
+        cfg = self.base_config()
+        cfg["global_settings"]["proxy_client_network_name"] = "chamosel-clients"
+        cfg["global_settings"]["proxy_client_network_external"] = True
+        cfg["global_settings"]["proxy_client_network_alias"] = "chamosel-proxy"
+
+        self.chamosel.generate(cfg)
+        compose = yaml.safe_load(Path("docker-compose.yml").read_text())
+
+        self.assertEqual(
+            {"name": "chamosel-clients", "external": True},
+            compose["networks"]["proxy-client-net"],
+        )
+        self.assertEqual(
+            {"aliases": ["chamosel-proxy"]},
+            compose["services"]["haproxy"]["networks"]["proxy-client-net"],
+        )
+        self.assertNotIn("proxy-client-net", compose["services"]["controller"]["networks"])
+        self.assertNotIn("proxy-client-net", compose["services"]["surfshark_0"]["networks"])
+
+    def test_proxy_client_network_empty_alias_uses_default(self):
+        cfg = self.base_config()
+        cfg["global_settings"]["proxy_client_network_name"] = "chamosel-clients"
+        cfg["global_settings"]["proxy_client_network_alias"] = ""
+
+        self.chamosel.generate(cfg)
+        compose = yaml.safe_load(Path("docker-compose.yml").read_text())
+
+        self.assertEqual(
+            {"aliases": ["chamosel-proxy"]},
+            compose["services"]["haproxy"]["networks"]["proxy-client-net"],
+        )
+
+    def test_proxy_client_network_rejects_invalid_name(self):
+        cfg = self.base_config()
+        cfg["global_settings"]["proxy_client_network_name"] = "../bad"
+
+        with self.assertLogs("chamosel", level="ERROR") as logs:
+            with self.assertRaises(SystemExit):
+                self.chamosel.generate(cfg)
+
+        rendered = "\n".join(logs.output)
+        self.assertIn("proxy_client_network_name", rendered)
+        self.assertNotIn("config-secret", rendered)
 
     def test_explicit_remote_bind_requires_controller_auth(self):
         cfg = self.base_config()

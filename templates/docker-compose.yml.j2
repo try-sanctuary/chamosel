@@ -53,7 +53,12 @@ services:
     volumes:
       - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
     networks:
-      - chamosel-net
+      chamosel-net:
+{% if proxy_client_network_name %}
+      proxy-client-net:
+        aliases:
+          - {{ proxy_client_network_alias | tojson }}
+{% endif %}
 
   controller:
     container_name: chamosel-ctrl
@@ -105,3 +110,10 @@ volumes:
 
 networks:
   chamosel-net:
+{% if proxy_client_network_name %}
+  proxy-client-net:
+    name: {{ proxy_client_network_name | tojson }}
+{% if proxy_client_network_external == "true" %}
+    external: true
+{% endif %}
+{% endif %}

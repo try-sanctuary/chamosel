@@ -4,6 +4,9 @@ global_settings:
   api_bind: 127.0.0.1       # controller API/dashboard host bind; use 0.0.0.0 only behind firewall/auth
   stats_port: 8404          # HAProxy stats UI at /stats
   stats_bind: 127.0.0.1     # stats host bind; non-loopback requires stats auth or CIDR allowlist
+  proxy_client_network_name: "" # optional Docker network for client containers to reach HAProxy by alias
+  proxy_client_network_external: false # true when the client network is created outside chamosel
+  proxy_client_network_alias: chamosel-proxy # proxy DNS name inside proxy_client_network_name
   allow_public_proxy: false # set true only with proxy_allowed_cidrs and firewall/reverse-proxy controls
   proxy_allowed_cidrs: ""   # comma-separated source CIDRs allowed to use a non-loopback proxy bind
   stats_auth_user: ""       # optional HAProxy stats username when exposing stats

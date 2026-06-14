@@ -24,6 +24,7 @@ request client ──http_proxy──> HAProxy :8888 ──tcp──> gluetun_0 
 - **Health-aware pool** — HAProxy probes gluetun's health server (`:9999`), not the proxy port. A gluetun with a dead VPN still answers on the proxy port; chamosel evicts it properly.
 - **Observable** — Prometheus `/metrics`, auto-refreshing dashboard at `/`, per-instance IP history, latest rotation outcome, and cooldown state persisted across controller restarts.
 - **Cooldown** — prevents hammering the same instance after recent rotation or recovery failures; forced override is explicit on `/rotate/<name>`.
+- **Container client network** — optionally attach only HAProxy to a shared Docker network so another container can resolve the proxy by alias without exposing controller or gluetun backends.
 - **Mixed providers** — Surfshark, ProtonVPN, Mullvad, etc. in the same pool.
 
 ## Quick start
@@ -211,6 +212,9 @@ global_settings:
   api_bind: 127.0.0.1       # use 0.0.0.0 only behind firewall/auth
   stats_port: 8404
   stats_bind: 127.0.0.1     # non-loopback requires stats auth or stats_allowed_cidrs
+  proxy_client_network_name: "" # optional Docker network for client containers
+  proxy_client_network_external: false # true when the network already exists
+  proxy_client_network_alias: chamosel-proxy # DNS name for HAProxy on that network
   allow_public_proxy: false # public proxy is refused unless this is true and CIDRs are set
   proxy_allowed_cidrs: ""   # comma-separated source CIDRs allowed to use a non-loopback proxy bind
   stats_auth_user: ""       # optional HAProxy stats auth when stats are exposed
@@ -253,6 +257,34 @@ vpn_providers:
 
 Mix providers freely — each block becomes N gluetun instances in the pool.
 
+### Container-to-container proxy access
+
+If another container should use chamosel without publishing the proxy on a host interface, attach only HAProxy to a shared client network:
+
+```yaml
+global_settings:
+  proxy_bind: 127.0.0.1
+  proxy_port: 8890
+  proxy_client_network_name: chamosel-clients
+  proxy_client_network_external: true
+  proxy_client_network_alias: chamosel-proxy
+```
+
+Create the shared network once when `proxy_client_network_external: true`:
+
+```bash
+docker network create chamosel-clients
+```
+
+Attach the client container to the same network and use the proxy alias:
+
+```bash
+docker network connect chamosel-clients your-client-container
+docker exec your-client-container curl -x http://chamosel-proxy:8890 https://api.ipify.org
+```
+
+Only `chamosel-haproxy` joins the client network. The controller and gluetun backends stay on the internal pool network, so the client network is for request proxy traffic only.
+
 ## PHP integration
 
 `examples/client.php` — `ChamoselClient` with `fetchWithRetry()` that rotates automatically on HTTP 403/429.
@@ -279,6 +311,7 @@ $res = $client->fetchWithRetry('https://example.com/products');
 - **Image freshness:** `chamosel.py up` runs `docker compose pull --ignore-buildable` before starting the stack so runtime images such as gluetun do not silently stay stale. Use `chamosel.py up --no-pull` when you intentionally want to use only local cached images.
 - **Surfshark:** start live validation around `num_containers: 5` and increase carefully. Frequent `rotate/all` can run into provider recovery delays even when leak-only verification is stable.
 - **API/dashboard exposure:** ports `8888`, `8800`, and `8404` bind to localhost by default through `proxy_bind`, `api_bind`, and `stats_bind`. If you set `api_bind` to a non-loopback address, enable `controller_auth_enabled: true`. If you set `proxy_bind` to a non-loopback address, generation requires `allow_public_proxy: true` and `proxy_allowed_cidrs`; otherwise chamosel refuses to create an open proxy. If you set `stats_bind` to a non-loopback address, configure `stats_auth_user`/`stats_auth_password` or `stats_allowed_cidrs`. Keep firewall/reverse-proxy controls in front of any public host bind.
+- **Client Docker network:** set `proxy_client_network_name` when selected client containers should reach the proxy by Docker DNS name. Use `proxy_client_network_external: true` for an existing operator-managed network, or leave it `false` to let compose create the named network. `proxy_client_network_alias` defaults to `chamosel-proxy`. This does not expose the controller or gluetun backends on that network.
 - **Docker volumes:** `chamosel.py down` preserves volumes (gluetun servers cache + state). Use `docker compose down -v` to wipe everything.
 - **Python runtime:** `dataclasses` is part of Python's standard library in supported Python versions. If it is missing, the host is running an old Python interpreter; install Python 3.10+ and use a virtual environment.
 

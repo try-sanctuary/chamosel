@@ -65,6 +65,9 @@ DEFAULTS = {
     "api_bind": "127.0.0.1",
     "stats_bind": "127.0.0.1",
     "stats_port": 8404,
+    "proxy_client_network_name": "",
+    "proxy_client_network_external": False,
+    "proxy_client_network_alias": "chamosel-proxy",
     "allow_public_proxy": False,
     "proxy_allowed_cidrs": "",
     "stats_auth_user": "",
@@ -216,6 +219,18 @@ def gluetun_dns_env_overrides(cfg: dict) -> dict:
     if plain_addresses:
         out["DNS_UPSTREAM_PLAIN_ADDRESSES"] = plain_addresses
     return out
+
+
+def proxy_client_network_config(cfg: dict) -> dict:
+    name = str(gset(cfg, "proxy_client_network_name") or "").strip()
+    alias = str(gset(cfg, "proxy_client_network_alias") or "").strip()
+    if not alias:
+        alias = DEFAULTS["proxy_client_network_alias"]
+    return {
+        "name": name,
+        "external": truthy(gset(cfg, "proxy_client_network_external")),
+        "alias": alias,
+    }
 
 
 def env_for(pkey: str, prov: dict, global_env: dict | None = None) -> dict:
@@ -436,6 +451,10 @@ def validate_config(cfg: dict):
     validate_egress_target_url(gset(cfg, "egress_verify_target"))
     validate_cidrs(gset(cfg, "proxy_allowed_cidrs"), "proxy_allowed_cidrs")
     validate_cidrs(gset(cfg, "stats_allowed_cidrs"), "stats_allowed_cidrs")
+    client_network = proxy_client_network_config(cfg)
+    if client_network["name"]:
+        validate_name(client_network["name"], "proxy_client_network_name")
+        validate_name(client_network["alias"], "proxy_client_network_alias")
     for pkey, prov in cfg.get("vpn_providers", {}).items():
         validate_name(pkey, "provider key")
         for key in (prov.get("env") or {}).keys():
@@ -510,6 +529,7 @@ def generate(cfg: dict):
     names = [n for n, _, _ in instances]
 
     gluetun_global_env = gluetun_dns_env_overrides(cfg)
+    proxy_client_network = proxy_client_network_config(cfg)
     stats_url = f"http://{display_host(gset(cfg, 'stats_bind'))}:{gset(cfg, 'stats_port')}/stats"
     compose = jinja.get_template("docker-compose.yml.j2").render(
         instances=[{"name": n, "env": env_for(pk, pv, gluetun_global_env)} for n, pk, pv in instances],
@@ -518,6 +538,9 @@ def generate(cfg: dict):
         haproxy_image=gset(cfg, "haproxy_image"),
         env_file=gset(cfg, "env_file"),
         proxy_bind=gset(cfg, "proxy_bind"),
+        proxy_client_network_name=proxy_client_network["name"],
+        proxy_client_network_external=str(proxy_client_network["external"]).lower(),
+        proxy_client_network_alias=proxy_client_network["alias"],
         api_bind=gset(cfg, "api_bind"),
         stats_bind=gset(cfg, "stats_bind"),
         proxy_allowed_cidrs=validate_cidrs(gset(cfg, "proxy_allowed_cidrs"), "proxy_allowed_cidrs"),
