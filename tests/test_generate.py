@@ -73,7 +73,8 @@ class GenerateTests(unittest.TestCase):
         self.assertEqual("${CONTROLLER_AUTH_TOKEN}", controller_env["CONTROLLER_AUTH_TOKEN"])
 
         gluetun_env = compose["services"]["surfshark_0"]["environment"]
-        self.assertIn("config-secret", gluetun_env["HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE"])
+        self.assertNotIn("config-secret", gluetun_env["HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE"])
+        self.assertIn("${GLUETUN_API_KEY}", gluetun_env["HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE"])
 
     def test_env_values_are_mapping_quoted_and_yaml_safe(self):
         self.chamosel.generate(self.base_config())
@@ -105,10 +106,33 @@ class GenerateTests(unittest.TestCase):
 
         self.assertNotIn("config-secret", "\n".join(logs.output))
 
+    def test_public_proxy_requires_explicit_allowlist(self):
+        cfg = self.base_config()
+        cfg["global_settings"]["proxy_bind"] = "0.0.0.0"
+
+        with self.assertLogs("chamosel", level="ERROR") as logs:
+            with self.assertRaises(SystemExit):
+                self.chamosel.generate(cfg)
+
+        rendered = "\n".join(logs.output)
+        self.assertIn("allow_public_proxy", rendered)
+        self.assertNotIn("config-secret", rendered)
+
+    def test_public_stats_requires_auth_or_allowlist(self):
+        cfg = self.base_config()
+        cfg["global_settings"]["stats_bind"] = "0.0.0.0"
+
+        with self.assertLogs("chamosel", level="ERROR") as logs:
+            with self.assertRaises(SystemExit):
+                self.chamosel.generate(cfg)
+
+        rendered = "\n".join(logs.output)
+        self.assertIn("stats_auth_user", rendered)
+        self.assertNotIn("config-secret", rendered)
+
     def test_explicit_remote_bind_renders_when_controller_auth_enabled(self):
         cfg = self.base_config()
         cfg["global_settings"]["api_bind"] = "0.0.0.0"
-        cfg["global_settings"]["stats_bind"] = "0.0.0.0"
         cfg["global_settings"]["controller_auth_enabled"] = True
         cfg["global_settings"]["controller_auth_token"] = "controller-secret"
 
@@ -120,21 +144,46 @@ class GenerateTests(unittest.TestCase):
         self.assertIn("CONTROLLER_AUTH_TOKEN=controller-secret\n", env_text)
         self.assertEqual("true", controller_env["CONTROLLER_AUTH_ENABLED"])
         self.assertEqual("${CONTROLLER_AUTH_TOKEN}", controller_env["CONTROLLER_AUTH_TOKEN"])
-        self.assertIn("0.0.0.0:8888:8888/tcp", compose["services"]["haproxy"]["ports"])
+        self.assertIn("127.0.0.1:8888:8888/tcp", compose["services"]["haproxy"]["ports"])
         self.assertIn("0.0.0.0:8800:8800/tcp", compose["services"]["controller"]["ports"])
-        self.assertIn("0.0.0.0:8404:8404/tcp", compose["services"]["haproxy"]["ports"])
+        self.assertIn("127.0.0.1:8404:8404/tcp", compose["services"]["haproxy"]["ports"])
 
     def test_explicit_proxy_bind_renders_independently_from_api_bind(self):
         cfg = self.base_config()
         cfg["global_settings"]["proxy_bind"] = "10.20.20.3"
         cfg["global_settings"]["api_bind"] = "127.0.0.1"
         cfg["global_settings"]["proxy_port"] = 8890
+        cfg["global_settings"]["allow_public_proxy"] = True
+        cfg["global_settings"]["proxy_allowed_cidrs"] = "10.20.20.0/24"
 
         self.chamosel.generate(cfg)
         compose = yaml.safe_load(Path("docker-compose.yml").read_text())
 
         self.assertIn("10.20.20.3:8890:8890/tcp", compose["services"]["haproxy"]["ports"])
         self.assertIn("127.0.0.1:8800:8800/tcp", compose["services"]["controller"]["ports"])
+        haproxy = Path("haproxy.cfg").read_text()
+        self.assertIn("acl allowed_proxy_src src 10.20.20.0/24", haproxy)
+        self.assertIn("tcp-request connection reject unless allowed_proxy_src", haproxy)
+
+    def test_generated_env_permissions_are_restrictive(self):
+        self.chamosel.generate(self.base_config())
+
+        mode = Path(".env").stat().st_mode & 0o777
+
+        self.assertEqual(0o600, mode)
+
+    def test_broad_env_local_permissions_warn_without_secret_value(self):
+        cfg = self.base_config()
+        cfg["global_settings"]["env_file"] = ".env.local"
+        Path(".env.local").write_text("CONTROLLER_AUTH_TOKEN=local-controller-secret\n")
+        os.chmod(".env.local", 0o644)
+
+        with self.assertLogs("chamosel", level="WARNING") as logs:
+            self.chamosel.generate(cfg)
+
+        rendered = "\n".join(logs.output)
+        self.assertIn("chmod 600 .env.local", rendered)
+        self.assertNotIn("local-controller-secret", rendered)
 
     def test_controller_auth_token_can_come_from_env_local(self):
         cfg = self.base_config()
@@ -192,6 +241,16 @@ class GenerateTests(unittest.TestCase):
         self.assertNotIn("DNS_UPSTREAM_RESOLVER_TYPE", env)
         self.assertNotIn("DNS_UPSTREAM_RESOLVERS", env)
         self.assertNotIn("DNS_UPSTREAM_PLAIN_ADDRESSES", env)
+
+    def test_unsafe_egress_target_is_rejected(self):
+        cfg = self.base_config()
+        cfg["global_settings"]["egress_verify_target"] = "http://169.254.169.254/latest/meta-data"
+
+        with self.assertLogs("chamosel", level="ERROR") as logs:
+            with self.assertRaises(SystemExit):
+                self.chamosel.generate(cfg)
+
+        self.assertIn("egress_verify_target", "\n".join(logs.output))
 
     def test_gluetun_dns_upstream_overrides_render_when_configured(self):
         cfg = self.base_config()
@@ -306,12 +365,16 @@ class GenerateTests(unittest.TestCase):
         cfg = self.base_config()
         cfg["global_settings"]["stats_bind"] = "10.20.20.4"
         cfg["global_settings"]["stats_port"] = 8405
+        cfg["global_settings"]["stats_auth_user"] = "ops"
+        cfg["global_settings"]["stats_auth_password"] = "stats-secret"
 
         self.chamosel.generate(cfg)
         compose = yaml.safe_load(Path("docker-compose.yml").read_text())
         env = compose["services"]["controller"]["environment"]
 
         self.assertEqual("http://10.20.20.4:8405/stats", env["DASHBOARD_STATS_URL"])
+        haproxy = Path("haproxy.cfg").read_text()
+        self.assertIn("stats auth ops:stats-secret", haproxy)
 
     def test_compose_cmd_sanitizes_missing_plugin_help_output(self):
         leaked_help = (

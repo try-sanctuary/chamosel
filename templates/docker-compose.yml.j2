@@ -8,6 +8,8 @@ services:
       - NET_ADMIN
     devices:
       - /dev/net/tun
+    security_opt:
+      - no-new-privileges:true
 {% if env_file %}
     env_file:
       - {{ env_file | tojson }}
@@ -37,6 +39,13 @@ services:
   haproxy:
     container_name: chamosel-haproxy
     image: {{ haproxy_image }}
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
     ports:
       - "{{ proxy_bind }}:{{ proxy_port }}:{{ proxy_port }}/tcp"
       - "{{ stats_bind }}:{{ stats_port }}:{{ stats_port }}/tcp"
@@ -49,6 +58,13 @@ services:
   controller:
     container_name: chamosel-ctrl
     build: ./controller
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
     ports:
       - "{{ api_bind }}:{{ api_port }}:{{ controller_port }}/tcp"
     environment:
@@ -57,6 +73,7 @@ services:
       GLUETUN_API_KEY: "${GLUETUN_API_KEY}"
       CONTROLLER_AUTH_ENABLED: "{{ controller_auth_enabled }}"
       CONTROLLER_AUTH_TOKEN: "${CONTROLLER_AUTH_TOKEN}"
+      PYTHONDONTWRITEBYTECODE: "1"
       LISTEN_PORT: "{{ controller_port }}"
       AUTO_ROTATE_SECONDS: "{{ auto_rotate }}"
       ROTATE_COOLDOWN: "{{ rotate_cooldown }}"

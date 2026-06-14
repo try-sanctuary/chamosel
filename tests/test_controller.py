@@ -115,9 +115,10 @@ class ControllerTests(unittest.TestCase):
         called = {"refresh": False}
         captured = {}
 
-        def fake_refresh(verify_egress=False, force_egress=False):
+        def fake_refresh(verify_egress=False, force_egress=False, allow_repair=True):
             called["refresh"] = True
             captured["verify_egress"] = verify_egress
+            captured["allow_repair"] = allow_repair
             self.ctrl.STATE.update_health("vpn_0", True, "9.9.9.9", status=self.ctrl.STATUS_HEALTHY)
 
         handler = self.ctrl.Handler.__new__(self.ctrl.Handler)
@@ -129,6 +130,7 @@ class ControllerTests(unittest.TestCase):
 
         self.assertTrue(called["refresh"])
         self.assertTrue(captured["verify_egress"])
+        self.assertFalse(captured["allow_repair"])
         self.assertEqual(200, captured["code"])
         self.assertEqual("9.9.9.9", captured["payload"]["instances"][0]["public_ip"])
 
@@ -211,6 +213,49 @@ class ControllerTests(unittest.TestCase):
         self.assertIn("text/html", captured["ctype"])
         self.assertIn("chamosel", captured["body"])
         self.assertNotIn("controller-token", captured["body"])
+
+    def test_controller_login_sets_httponly_cookie(self):
+        ctrl = load_controller(
+            self.tmp.name,
+            env_overrides={"CONTROLLER_AUTH_ENABLED": "true", "CONTROLLER_AUTH_TOKEN": "controller-token"},
+        )
+        captured = {}
+
+        handler = ctrl.Handler.__new__(ctrl.Handler)
+        handler.path = "/login"
+        handler.headers = {"X-Chamosel-Auth": "controller-token"}
+        handler._raw = lambda code, body, ctype, headers=None: captured.update(
+            {"code": code, "headers": headers or {}}
+        )
+        handler._json = lambda code, payload: captured.update({"code": code, "payload": payload})
+
+        handler.do_POST()
+
+        self.assertEqual(204, captured["code"])
+        cookie = captured["headers"]["Set-Cookie"]
+        self.assertIn("chamosel_auth=controller-token", cookie)
+        self.assertIn("HttpOnly", cookie)
+        self.assertIn("SameSite=Strict", cookie)
+
+    def test_cookie_authenticated_post_requires_csrf_header(self):
+        ctrl = load_controller(
+            self.tmp.name,
+            env_overrides={"CONTROLLER_AUTH_ENABLED": "true", "CONTROLLER_AUTH_TOKEN": "controller-token"},
+        )
+        captured = {}
+        calls = []
+
+        handler = ctrl.Handler.__new__(ctrl.Handler)
+        handler.path = "/rotate"
+        handler.headers = {"Cookie": "chamosel_auth=controller-token"}
+        handler._json = lambda code, payload: captured.update({"code": code, "payload": payload})
+        ctrl.rotate_one_random = lambda *args, **kwargs: calls.append("rotate") or {"ok": True}
+
+        handler.do_POST()
+
+        self.assertEqual(403, captured["code"])
+        self.assertEqual({"error": "csrf_required"}, captured["payload"])
+        self.assertEqual([], calls)
 
     def test_controller_health_remains_public_when_auth_enabled(self):
         ctrl = load_controller(
@@ -449,6 +494,18 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual("proxy refused", result["error"])
         self.assertEqual("proxy refused", snap["instances"][0]["verified_proxy_ip_error"])
         self.assertIn(self.ctrl.DEGRADED_EGRESS_VERIFICATION_FAILED, snap["degraded_reasons"])
+
+    def test_unsafe_egress_target_is_rejected_before_probe(self):
+        ctrl = load_controller(
+            self.tmp.name,
+            env_overrides={"EGRESS_VERIFY_TARGET": "http://169.254.169.254/latest/meta-data"},
+        )
+
+        ip, error, metadata = ctrl.probe_verified_proxy_ip("vpn_0")
+
+        self.assertIsNone(ip)
+        self.assertEqual({}, metadata)
+        self.assertIn("https URL", error)
 
     def test_refresh_verified_proxy_ip_uses_ttl_cache(self):
         calls = []
@@ -738,6 +795,36 @@ class ControllerTests(unittest.TestCase):
 
         self.assertEqual(200, captured["code"])
         self.assertEqual([("vpn_0", False)], calls)
+
+    def test_named_rotate_defaults_to_non_forced(self):
+        ctrl = load_controller(
+            self.tmp.name,
+            env_overrides={"CONTROLLER_AUTH_ENABLED": "true", "CONTROLLER_AUTH_TOKEN": "controller-token"},
+        )
+        calls = []
+        captured = {}
+
+        handler = ctrl.Handler.__new__(ctrl.Handler)
+        handler.path = "/rotate/vpn_0"
+        handler.headers = {"X-Chamosel-Auth": "controller-token"}
+        handler._json = lambda code, payload: captured.update({"code": code, "payload": payload})
+        ctrl.rotate_instance = lambda instance, force=False: calls.append((instance, force)) or {"ok": True}
+
+        handler.do_POST()
+
+        self.assertEqual(200, captured["code"])
+        self.assertEqual([("vpn_0", False)], calls)
+
+    def test_rotation_in_progress_returns_explicit_outcome(self):
+        lock = self.ctrl.rotation_lock_for("vpn_0")
+        self.assertTrue(lock.acquire(blocking=False))
+        try:
+            result = self.ctrl.rotate_instance("vpn_0")
+        finally:
+            lock.release()
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(self.ctrl.OUTCOME_ROTATION_IN_PROGRESS, result["outcome"])
 
     def test_duplicate_verified_proxy_ip_refresh_schedules_one_repair_rotation(self):
         calls = []
