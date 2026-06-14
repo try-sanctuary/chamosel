@@ -31,3 +31,19 @@
 **Alternatives considered**:
 - Always fail on country mismatch: rejected as too noisy for anycast and provider DNS deployments.
 - Never fail on mismatch: rejected because operators need a clear signal for possible DNS leaks.
+
+## Decision: Treat ASN mismatch as warning by default after live validation
+
+**Rationale**: Live gluetun testing showed the default container DNS path uses gluetun's local DNS listener with Cloudflare DNS-over-TLS upstreams. That produces resolver ASN mismatch even when host DNS is not leaking. The default CLI behavior should therefore pass with a warning, while `--strict-dns-asn` remains available for operators whose policy requires resolver ASN to match backend ASN.
+
+**Alternatives considered**:
+- Keep failing by default: rejected because it creates false failures for gluetun's documented default DNS behavior.
+- Remove ASN reporting: rejected because operators still need the signal for strict environments.
+
+## Decision: Duplicate repair success can use verified proxy IP
+
+**Rationale**: Verified proxy IP is the preferred source of truth for pool diversity. Live repair showed a backend can leave the duplicated verified proxy IP while gluetun's control API public IP remains unchanged or mismatched. Duplicate repair should count that as recovery success instead of timing out.
+
+**Alternatives considered**:
+- Continue requiring gluetun public IP change: rejected because it contradicts verified egress semantics and creates false recovery timeouts.
+- Ignore public IP entirely for all rotations: rejected because non-repair rotations still benefit from the existing public-IP recovery signal when verified egress context is not involved.

@@ -95,6 +95,12 @@
 - [X] T021 Run `.venv/bin/python -m unittest discover -s tests -v`
 - [X] T022 Run `git diff --check`
 - [X] T023 Mark all completed tasks in this file
+- [X] T024 Update DNS verification policy after live validation so ASN mismatch is warning by default and strict ASN is opt-in
+- [X] T025 Add opt-in gluetun DNS upstream override config and generated compose tests
+- [X] T026 Update README, quickstart, and contract docs for gluetun default DNS and provider DNS overrides
+- [X] T027 Add regression test for duplicate repair success when verified proxy IP changes but gluetun public IP does not
+- [X] T028 Update controller rotation recovery to pass duplicate repair context and use verified proxy IP as repair success signal
+- [X] T029 Update Speckit docs for verified proxy IP repair recovery semantics
 
 ---
 

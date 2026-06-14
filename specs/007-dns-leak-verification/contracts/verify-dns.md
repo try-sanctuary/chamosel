@@ -6,6 +6,7 @@
 python3 chamosel.py verify-dns
 python3 chamosel.py verify-dns --json
 python3 chamosel.py verify-dns --timeout 30
+python3 chamosel.py verify-dns --strict-dns-asn
 ```
 
 ## Behavior
@@ -14,7 +15,8 @@ python3 chamosel.py verify-dns --timeout 30
 2. For each healthy backend, run the DNS leak challenge through that backend's HTTP proxy.
 3. Normalize the returned DNS leak service payload into a stable report.
 4. Print a human table by default or JSON with `--json`.
-5. Exit non-zero if any backend fails DNS verification, is suspicious, or cannot be checked.
+5. Exit non-zero if any backend fails DNS verification, has a fail-level DNS risk, or cannot be checked.
+6. Treat resolver ASN mismatch as a warning by default. With `--strict-dns-asn`, treat resolver ASN mismatch as a fail-level suspicious result.
 
 Unhealthy backends are included in the report with a safe error and do not run a DNS challenge.
 
@@ -24,6 +26,7 @@ Unhealthy backends are included in the report with a safe error and do not run a
 {
   "ok": false,
   "target": "bash.ws",
+  "policy": "external-ok",
   "verified_count": 1,
   "total_count": 2,
   "error": "one or more backends failed DNS leak verification",
@@ -44,6 +47,9 @@ Unhealthy backends are included in the report with a safe error and do not run a
       "resolver_count": 1,
       "asn_match": true,
       "suspected_leak": false,
+      "strict_asn": false,
+      "warnings": [],
+      "resolver_risks": [],
       "dns_ok": true,
       "conclusions": [],
       "error": null
@@ -64,5 +70,5 @@ The report must not include:
 
 ## Exit Codes
 
-- `0`: every included backend passed DNS verification.
-- `1`: one or more backends failed, were suspicious, were unhealthy, or the pool could not be read.
+- `0`: every included backend passed DNS verification. Default-policy warnings do not fail the command.
+- `1`: one or more backends failed, had fail-level DNS risk, were unhealthy, or the pool could not be read.

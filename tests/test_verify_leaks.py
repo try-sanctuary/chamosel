@@ -132,9 +132,45 @@ class VerifyLeakTests(unittest.TestCase):
         self.assertEqual(1, result["total_count"])
         self.assertTrue(result["instances"][0]["dns_ok"])
 
-    def test_verify_dns_leaks_flags_suspicious_asn_mismatch(self):
+    def test_verify_dns_leaks_warns_on_asn_mismatch_by_default(self):
         self.chamosel.fetch_pool_state = lambda cfg: self.pool()
         self.chamosel.run_backend_dns_probe = lambda instance, timeout: self.dns_payload(dns_asn="AS15169")
+
+        result = self.chamosel.verify_dns_leaks(self.cfg)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual("external-ok", result["policy"])
+        item = result["instances"][0]
+        self.assertTrue(item["dns_ok"])
+        self.assertFalse(item["suspected_leak"])
+        self.assertFalse(item["asn_match"])
+        self.assertIn("resolver ASN differs", item["warnings"][0])
+        self.assertIsNone(item["error"])
+
+    def test_verify_dns_leaks_strict_asn_flags_mismatch(self):
+        self.chamosel.fetch_pool_state = lambda cfg: self.pool()
+        self.chamosel.run_backend_dns_probe = lambda instance, timeout: self.dns_payload(dns_asn="AS15169")
+
+        result = self.chamosel.verify_dns_leaks(self.cfg, strict_asn=True)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual("strict-asn", result["policy"])
+        item = result["instances"][0]
+        self.assertFalse(item["dns_ok"])
+        self.assertTrue(item["suspected_leak"])
+        self.assertFalse(item["asn_match"])
+        self.assertIn("resolver ASN differs", item["error"])
+
+    def test_verify_dns_leaks_fails_non_global_resolver(self):
+        self.chamosel.fetch_pool_state = lambda cfg: self.pool()
+        self.chamosel.run_backend_dns_probe = lambda instance, timeout: self.dns_payload(dns_asn="AS9009")[:-2] + [
+            {
+                "type": "dns",
+                "ip": "192.168.65.7",
+                "country_name": "Private",
+                "asn": None,
+            },
+        ]
 
         result = self.chamosel.verify_dns_leaks(self.cfg)
 
@@ -142,8 +178,8 @@ class VerifyLeakTests(unittest.TestCase):
         item = result["instances"][0]
         self.assertFalse(item["dns_ok"])
         self.assertTrue(item["suspected_leak"])
-        self.assertFalse(item["asn_match"])
-        self.assertIn("resolver ASN differs", item["error"])
+        self.assertIn("not globally routable", item["error"])
+        self.assertEqual("192.168.65.7", item["resolver_risks"][0]["ip"])
 
     def test_verify_dns_leaks_reports_unhealthy_backend(self):
         self.chamosel.fetch_pool_state = lambda cfg: self.pool(healthy=False)
@@ -169,9 +205,10 @@ class VerifyLeakTests(unittest.TestCase):
         self.assertEqual("dns probe timed out", result["instances"][0]["error"])
 
     def test_verify_dns_json_output_shape_and_secret_safety(self):
-        self.chamosel.verify_dns_leaks = lambda cfg, timeout=30: {
+        self.chamosel.verify_dns_leaks = lambda cfg, timeout=30, strict_asn=False: {
             "ok": False,
             "target": "bash.ws",
+            "policy": "strict-asn",
             "verified_count": 0,
             "total_count": 1,
             "error": "one or more backends failed DNS leak verification",
@@ -186,6 +223,9 @@ class VerifyLeakTests(unittest.TestCase):
                     "resolver_count": 1,
                     "asn_match": False,
                     "suspected_leak": True,
+                    "strict_asn": True,
+                    "warnings": ["resolver ASN differs from connection ASN"],
+                    "resolver_risks": [],
                     "dns_ok": False,
                     "conclusions": [],
                     "error": "resolver ASN differs from connection ASN",
@@ -422,6 +462,7 @@ class VerifyLeakTests(unittest.TestCase):
         self.assertIn("--iterations", help_text)
         self.assertIn("--mode", help_text)
         self.assertIn("--repair", help_text)
+        self.assertIn("--strict-dns-asn", help_text)
         self.assertNotIn("GLUETUN_API_KEY", help_text)
         self.assertNotIn("CONTROLLER_AUTH_TOKEN", help_text)
         self.assertNotIn("WIREGUARD_PRIVATE_KEY", help_text)
@@ -844,9 +885,12 @@ class VerifyLeakTests(unittest.TestCase):
         self.assertIn("python3 chamosel.py verify-leaks --json", readme)
         self.assertIn("python3 chamosel.py verify-dns", readme)
         self.assertIn("python3 chamosel.py verify-dns --json", readme)
+        self.assertIn("python3 chamosel.py verify-dns --strict-dns-asn", readme)
         self.assertIn("doctor", readme)
         self.assertIn("without rotating", readme)
         self.assertIn("suspected", readme)
+        self.assertIn("Cloudflare DNS-over-TLS", readme)
+        self.assertIn("dns_upstream_plain_addresses", readme)
         self.assertIn("direct host IP differs", readme)
         self.assertIn("Browser WebRTC", readme)
         self.assertIn("socks5h://", readme)

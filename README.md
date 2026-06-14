@@ -110,11 +110,16 @@ python3 chamosel.py doctor
 python3 chamosel.py verify-leaks
 python3 chamosel.py verify-dns
 python3 chamosel.py verify-dns --json
+python3 chamosel.py verify-dns --strict-dns-asn
 ```
 
 `verify-dns` uses the same backend proxy path as `verify-leaks`, but asks a DNS leak challenge service to report which DNS resolvers were observed for each backend. The report shows the backend connection IP, connection ASN, resolver count, resolver ASN values, and a result per backend.
 
-A `suspected` or `resolver ASN differs from connection ASN` result is an investigation signal. It does not automatically rotate or repair anything. Some VPN providers can use DNS infrastructure with different metadata, so compare the result with provider documentation before changing live settings.
+By default, resolver ASN mismatch is reported as a warning rather than a failed leak check. This matches gluetun's default DNS behavior: gluetun runs a local DNS listener in the VPN container and forwards upstream queries to Cloudflare over DNS-over-TLS unless you override it. Use `--strict-dns-asn` when your policy requires resolver ASN to match the backend connection ASN.
+
+A `suspected` result means the probe found a fail-level DNS risk, such as a non-global/private resolver address or a probe failure. It does not automatically rotate or repair anything. If the only signal is `resolver ASN differs from connection ASN`, treat it as policy-dependent and compare it with provider documentation before changing live settings.
+
+To keep gluetun defaults, leave the DNS upstream settings empty. To choose named encrypted upstreams supported by gluetun, set `dns_upstream_resolver_type: dot` or `doh` and `dns_upstream_resolvers`, for example `cloudflare,quad9`. To force Surfshark/provider DNS addresses, set `dns_upstream_plain_addresses` to the `ip:port` values from the provider-generated WireGuard/OpenVPN config; chamosel will set `DNS_UPSTREAM_RESOLVER_TYPE=plain` for generated gluetun containers. Provider DNS over plaintext is opt-in because gluetun's own documentation recommends its encrypted default for privacy.
 
 ## Stress Validation
 
@@ -206,6 +211,9 @@ global_settings:
   egress_verify_timeout: 10
   egress_verify_ttl: 120
   egress_verify_on_fresh: true
+  # dns_upstream_resolver_type: "" # empty = gluetun default; dot/doh/plain when overriding
+  # dns_upstream_resolvers: ""     # named gluetun DoT/DoH resolvers, e.g. "cloudflare,quad9"
+  # dns_upstream_plain_addresses: "" # provider DNS ip:port list from provider config
   controller_auth_enabled: false
   # controller_auth_token: "" # optional; generated into .env when controller auth is enabled
   poll_interval: 15          # background health/IP poll interval
@@ -237,8 +245,9 @@ $res = $client->fetchWithRetry('https://example.com/products');
 - **Per-request IP rotation:** with `mode tcp`, one keep-alive connection pins one exit IP. Set `CURLOPT_FRESH_CONNECT` in PHP (already done in the example) or use `balance leastconn`.
 - **After rotation:** the controller waits up to `rotation_recovery_timeout` seconds for a healthy tunnel and changed public IP. If recovery times out, `/rotate` returns `ok: false` with outcome `recovery_timeout` and starts a cooldown for mass/automatic rotation. If the tunnel is healthy but the IP did not change, the outcome is `healthy_ip_unchanged`.
 - **Verified egress IP:** `/pool?fresh=1` verifies each healthy backend by requesting `egress_verify_target` through that backend's HTTP proxy and caches the resulting `verified_proxy_ip` for `egress_verify_ttl` seconds. Diversity checks prefer fresh verified proxy IPs over gluetun's `/v1/publicip/ip` value. A `public_ip_mismatch` is visible degraded state, but not an automatic repair trigger by itself.
+- **DNS upstream policy:** by default chamosel does not render gluetun DNS upstream env vars, so gluetun keeps its default Cloudflare DNS-over-TLS resolver. Set `dns_upstream_resolvers` only for named encrypted upstreams supported by gluetun. Set `dns_upstream_plain_addresses` only when you intentionally want provider DNS addresses such as those from a Surfshark manual config; this switches generated gluetun services to plain upstream DNS.
 - **Controller auth:** `controller_auth_enabled: true` protects the dashboard, `/pool`, `/metrics`, `/rotate*`, and `/repair/duplicate-ip` with `X-Chamosel-Auth`. The CLI reads `CONTROLLER_AUTH_TOKEN` from the environment, `.env`, or `global_settings.controller_auth_token` and sends the header automatically. `/health` remains public for liveness checks. If `api_bind` is not loopback, generation fails unless controller auth is enabled.
-- **Pool status:** `/pool`, `/metrics`, `status`, and the dashboard expose `pool_status` as `healthy`, `degraded`, or `down`. The pool is degraded when state is stale after controller restart, too few backends are healthy, duplicate verified proxy IPs or fallback public IPs are detected, egress verification fails, public IP differs from verified proxy IP, or recent rotation recovery/proxy checks failed. With `auto_repair_duplicate_ips: true`, duplicate-IP detection after polling or `/pool?fresh=1` schedules one non-forced background rotation for a duplicate backend, respecting cooldown and `duplicate_repair_retry_cooldown`.
+- **Pool status:** `/pool`, `/metrics`, `status`, and the dashboard expose `pool_status` as `healthy`, `degraded`, or `down`. The pool is degraded when state is stale after controller restart, too few backends are healthy, duplicate verified proxy IPs or fallback public IPs are detected, egress verification fails, public IP differs from verified proxy IP, or recent rotation recovery/proxy checks failed. With `auto_repair_duplicate_ips: true`, duplicate-IP detection after polling or `/pool?fresh=1` schedules one non-forced background rotation for a duplicate backend, respecting cooldown and `duplicate_repair_retry_cooldown`. Duplicate repair treats a fresh verified proxy IP that has moved away from the duplicate as recovered, even if gluetun's control API public IP remains mismatched.
 - **Mass rotation:** `/rotate/all` rotates eligible backends in batches. The defaults are `rotate_all_batch_size: 2` and `rotate_all_batch_delay_seconds: 2`; keep `rotate_cooldown > 0` for live providers so repeated recovery failures back off instead of hammering the same account.
 - **Control API key:** `api_key` is not a paid gluetun key and not a provider subscription key. It is a local secret shared between gluetun's control server and the chamosel controller. If you set it in `config.yml`, `generate` writes the same value to `.env` so Docker Compose can pass it to the controller. If `.env` and `config.yml` disagree, generation fails instead of creating a split-brain auth setup.
 - **Controller auth token:** `controller_auth_token` is separate from `api_key`. It is the operator-facing chamosel controller token, not a gluetun/provider key. When auth is enabled and no token is configured, `generate` creates one in `.env`.

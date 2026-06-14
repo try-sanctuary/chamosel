@@ -437,7 +437,7 @@ class ControllerTests(unittest.TestCase):
 
     def test_duplicate_ip_repair_once_rotates_one_verified_duplicate(self):
         calls = []
-        self.ctrl.rotate_instance = lambda instance, force=False: calls.append((instance, force)) or {
+        self.ctrl.rotate_instance = lambda instance, force=False, repair_duplicate_ip=None: calls.append((instance, force, repair_duplicate_ip)) or {
             "instance": instance,
             "ok": True,
             "outcome": self.ctrl.OUTCOME_SUCCESS,
@@ -452,12 +452,42 @@ class ControllerTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertTrue(result["attempted"])
         self.assertEqual("vpn_1", result["target"])
-        self.assertEqual([("vpn_1", False)], calls)
+        self.assertEqual([("vpn_1", False, "45.134.140.5")], calls)
         self.assertEqual([], result["duplicate_repair"]["in_flight"])
+
+    def test_duplicate_repair_succeeds_when_verified_proxy_ip_changes_only(self):
+        commands = []
+
+        def fake_ctrl(method, instance, path, body=None):
+            if method == "GET" and path in self.ctrl.STATUS_PATHS:
+                return {"status": "running"}
+            if method == "PUT":
+                commands.append(body["status"])
+                return {}
+            raise AssertionError((method, path))
+
+        self.ctrl._ctrl = fake_ctrl
+        self.ctrl.is_healthy = lambda instance: True
+        self.ctrl.get_public_ip = lambda instance: "64.44.86.142"
+        self.ctrl.refresh_verified_proxy_ip = lambda instance, force=False: {"verified_proxy_ip": "37.19.221.87"}
+        self.ctrl.sleep = lambda seconds: None
+        self.ctrl.STATE.update_health("vpn_1", True, "64.44.86.142", status=self.ctrl.STATUS_HEALTHY)
+        self.ctrl.STATE.update_verified_proxy_ip("vpn_1", "64.44.86.142")
+
+        result = self.ctrl.rotate_instance("vpn_1", force=True, repair_duplicate_ip="64.44.86.142")
+
+        self.assertEqual(["stopped", "running"], commands)
+        self.assertTrue(result["ok"])
+        self.assertEqual(self.ctrl.OUTCOME_SUCCESS, result["outcome"])
+        self.assertEqual("37.19.221.87", result["verified_proxy_ip"])
+        self.assertEqual("64.44.86.142", result["new_ip"])
+        state = next(s for s in self.ctrl.STATE.snapshot()["instances"] if s["name"] == "vpn_1")
+        self.assertEqual(self.ctrl.OUTCOME_SUCCESS, state["last_rotation_outcome"])
+        self.assertNotEqual(self.ctrl.OUTCOME_RECOVERY_TIMEOUT, state["cooldown_reason"])
 
     def test_duplicate_ip_repair_once_does_not_rotate_mismatch_only(self):
         calls = []
-        self.ctrl.rotate_instance = lambda instance, force=False: calls.append((instance, force)) or {"ok": True}
+        self.ctrl.rotate_instance = lambda instance, force=False, repair_duplicate_ip=None: calls.append((instance, force, repair_duplicate_ip)) or {"ok": True}
         self.ctrl.STATE.update_health("vpn_0", True, "1.1.1.1", status=self.ctrl.STATUS_HEALTHY)
         self.ctrl.STATE.update_health("vpn_1", True, "1.1.1.1", status=self.ctrl.STATUS_HEALTHY)
         self.ctrl.STATE.update_verified_proxy_ip("vpn_0", "45.134.140.5")
@@ -502,7 +532,7 @@ class ControllerTests(unittest.TestCase):
         original_thread = self.ctrl.threading.Thread
         try:
             self.ctrl.threading.Thread = ImmediateThread
-            self.ctrl.rotate_instance = lambda instance, force=False: calls.append((instance, force)) or {
+            self.ctrl.rotate_instance = lambda instance, force=False, repair_duplicate_ip=None: calls.append((instance, force, repair_duplicate_ip)) or {
                 "instance": instance,
                 "ok": True,
                 "outcome": self.ctrl.OUTCOME_SUCCESS,
@@ -516,7 +546,7 @@ class ControllerTests(unittest.TestCase):
         finally:
             self.ctrl.threading.Thread = original_thread
 
-        self.assertEqual([("vpn_1", False)], calls)
+        self.assertEqual([("vpn_1", False, "45.134.140.5")], calls)
         self.assertEqual(1, self.ctrl.duplicate_repair_snapshot()["scheduled_total"])
 
     def test_duplicate_public_ip_refresh_schedules_one_repair_rotation(self):
@@ -533,7 +563,7 @@ class ControllerTests(unittest.TestCase):
         original_thread = self.ctrl.threading.Thread
         try:
             self.ctrl.threading.Thread = ImmediateThread
-            self.ctrl.rotate_instance = lambda instance, force=False: calls.append((instance, force)) or {
+            self.ctrl.rotate_instance = lambda instance, force=False, repair_duplicate_ip=None: calls.append((instance, force, repair_duplicate_ip)) or {
                 "instance": instance,
                 "ok": True,
                 "outcome": self.ctrl.OUTCOME_SUCCESS,
@@ -545,7 +575,7 @@ class ControllerTests(unittest.TestCase):
         finally:
             self.ctrl.threading.Thread = original_thread
 
-        self.assertEqual([("vpn_1", False)], calls)
+        self.assertEqual([("vpn_1", False, "1.1.1.1")], calls)
         self.assertEqual(1, self.ctrl.duplicate_repair_snapshot()["scheduled_total"])
 
     def test_duplicate_public_ip_repair_respects_cooldown(self):
@@ -573,7 +603,7 @@ class ControllerTests(unittest.TestCase):
         try:
             self.ctrl.threading.Thread = ImmediateThread
             self.ctrl.DUPLICATE_REPAIR_RETRY_COOLDOWN = 300
-            self.ctrl.rotate_instance = lambda instance, force=False: calls.append((instance, force)) or {
+            self.ctrl.rotate_instance = lambda instance, force=False, repair_duplicate_ip=None: calls.append((instance, force, repair_duplicate_ip)) or {
                 "instance": instance,
                 "ok": False,
                 "outcome": self.ctrl.OUTCOME_RECOVERY_TIMEOUT,
@@ -586,7 +616,7 @@ class ControllerTests(unittest.TestCase):
         finally:
             self.ctrl.threading.Thread = original_thread
 
-        self.assertEqual([("vpn_1", False)], calls)
+        self.assertEqual([("vpn_1", False, "1.1.1.1")], calls)
         repair = self.ctrl.duplicate_repair_snapshot()
         self.assertEqual(1, repair["scheduled_total"])
         self.assertGreater(repair["backoff_remaining"]["vpn_1"], 0)
