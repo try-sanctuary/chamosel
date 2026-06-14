@@ -20,6 +20,7 @@ global_settings:
   egress_verify_timeout: 10 # per-backend verified proxy IP timeout
   egress_verify_ttl: 120    # seconds to trust cached verified proxy IP
   egress_verify_on_fresh: true # /pool?fresh=1 refreshes verified proxy IP when expired
+  dashboard_refresh_seconds: 5 # default dashboard auto-refresh interval; 0 disables
   # DNS upstream overrides for gluetun. Leave empty to keep gluetun defaults.
   # dns_upstream_resolver_type: "" # dot/doh/plain; auto plain when dns_upstream_plain_addresses is set
   # dns_upstream_resolvers: "" # named DoT/DoH resolvers, e.g. "cloudflare,quad9"

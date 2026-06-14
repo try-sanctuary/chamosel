@@ -78,6 +78,7 @@ DEFAULTS = {
     "egress_verify_timeout": 10,
     "egress_verify_ttl": 120,
     "egress_verify_on_fresh": True,
+    "dashboard_refresh_seconds": 5,
     "dns_upstream_resolver_type": "",
     "dns_upstream_resolvers": "",
     "dns_upstream_plain_addresses": "",
@@ -392,6 +393,7 @@ def generate(cfg: dict):
         egress_verify_timeout=gset(cfg, "egress_verify_timeout"),
         egress_verify_ttl=gset(cfg, "egress_verify_ttl"),
         egress_verify_on_fresh=str(gset(cfg, "egress_verify_on_fresh")).lower(),
+        dashboard_refresh_seconds=gset(cfg, "dashboard_refresh_seconds"),
         controller_auth_enabled=str(controller_auth_enabled(cfg)).lower(),
         poll_interval=gset(cfg, "poll_interval"),
         auth_default_role=auth_role,
@@ -1189,7 +1191,7 @@ def doctor_report(cfg: dict, repair: bool = False) -> dict:
             repair_result = api_call_result(
                 cfg,
                 "POST",
-                "/repair/duplicate-ip",
+                "/repair",
                 timeout=max(15, int(gset(cfg, "rotation_recovery_timeout")) + 15),
             )
         else:
@@ -1319,17 +1321,54 @@ def doctor_repair_decision(pool_ok: bool, pool_payload: dict) -> dict:
             "message": "fresh pool check requested duplicate egress IP repair",
         }
 
+    if "egress_verification_failed" in reasons or "proxy_failure" in reasons:
+        if not duplicate_repair.get("enabled", False):
+            return {
+                "action": "manual",
+                "reason": "proxy_repair_disabled",
+                "message": "proxy/egress failure detected, but automatic repair is disabled",
+            }
+        in_flight = duplicate_repair.get("in_flight") or []
+        if in_flight:
+            return {
+                "action": "repair_in_progress",
+                "reason": "proxy_failure",
+                "targets": in_flight,
+                "message": "pool repair is already rotating one backend",
+            }
+        backoff = duplicate_repair.get("backoff_remaining") or {}
+        if backoff:
+            return {
+                "action": "wait_backoff",
+                "reason": "proxy_failure",
+                "backoff_remaining": backoff,
+                "message": "pool repair recently failed; waiting before retry",
+            }
+        targets = [
+            s.get("name")
+            for s in pool_payload.get("instances") or []
+            if s.get("healthy") and (
+                s.get("last_rotation_outcome") == "proxy_failure"
+                or (s.get("verified_proxy_ip_error") and not s.get("egress_state_fresh"))
+            )
+        ]
+        if targets:
+            return {
+                "action": "repair_requested",
+                "reason": "proxy_failure",
+                "targets": targets,
+                "message": "fresh pool check found proxy/egress failure; request one backend repair rotation",
+            }
+        return {
+            "action": "manual",
+            "reason": "egress_verification_failed",
+            "message": "controller could not verify proxy egress; inspect backend proxy/network before rotating",
+        }
     if "public_ip_mismatch" in reasons:
         return {
             "action": "monitor",
             "reason": "public_ip_mismatch",
             "message": "gluetun public IP differs from verified proxy IP; no rotation unless verified proxy IP is duplicated",
-        }
-    if "egress_verification_failed" in reasons:
-        return {
-            "action": "manual",
-            "reason": "egress_verification_failed",
-            "message": "controller could not verify proxy egress; inspect backend proxy/network before rotating",
         }
     if "stale_state" in reasons:
         return {

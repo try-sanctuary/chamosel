@@ -561,6 +561,25 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(200, captured["code"])
         self.assertEqual("none", captured["payload"]["outcome"])
 
+    def test_named_rotate_can_be_non_forced_from_query(self):
+        ctrl = load_controller(
+            self.tmp.name,
+            env_overrides={"CONTROLLER_AUTH_ENABLED": "true", "CONTROLLER_AUTH_TOKEN": "controller-token"},
+        )
+        calls = []
+        captured = {}
+
+        handler = ctrl.Handler.__new__(ctrl.Handler)
+        handler.path = "/rotate/vpn_0?force=0"
+        handler.headers = {"X-Chamosel-Auth": "controller-token"}
+        handler._json = lambda code, payload: captured.update({"code": code, "payload": payload})
+        ctrl.rotate_instance = lambda instance, force=False: calls.append((instance, force)) or {"ok": True}
+
+        handler.do_POST()
+
+        self.assertEqual(200, captured["code"])
+        self.assertEqual([("vpn_0", False)], calls)
+
     def test_duplicate_verified_proxy_ip_refresh_schedules_one_repair_rotation(self):
         calls = []
 
@@ -803,6 +822,72 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(self.ctrl.OUTCOME_PROXY_FAILURE, result["outcome"])
         self.assertIn("proxy refused", result["message"])
 
+    def test_proxy_failure_degraded_state_clears_after_fresh_egress_success(self):
+        self.ctrl.STATE.update_health("vpn_0", True, "1.1.1.1", status=self.ctrl.STATUS_HEALTHY)
+        self.ctrl.STATE.record_rotation("vpn_0", self.ctrl.OUTCOME_PROXY_FAILURE)
+        degraded = self.ctrl.STATE.snapshot()
+
+        self.assertEqual(self.ctrl.POOL_STATUS_DEGRADED, degraded["pool_status"])
+        self.assertIn(self.ctrl.DEGRADED_PROXY_FAILURE, degraded["degraded_reasons"])
+
+        self.ctrl.STATE.update_verified_proxy_ip("vpn_0", "2.2.2.2", None)
+        recovered = self.ctrl.STATE.snapshot()
+
+        self.assertNotIn(self.ctrl.DEGRADED_PROXY_FAILURE, recovered["degraded_reasons"])
+
+    def test_repair_endpoint_rotates_proxy_failed_backend(self):
+        ctrl = load_controller(
+            self.tmp.name,
+            env_overrides={"CONTROLLER_AUTH_ENABLED": "true", "CONTROLLER_AUTH_TOKEN": "controller-token"},
+        )
+        calls = []
+        captured = {}
+
+        ctrl.STATE.update_health("vpn_0", True, "1.1.1.1", status=ctrl.STATUS_HEALTHY)
+        ctrl.STATE.record_rotation("vpn_0", ctrl.OUTCOME_PROXY_FAILURE)
+        ctrl.rotate_instance = lambda instance, force=False, repair_duplicate_ip=None: calls.append(
+            (instance, force, repair_duplicate_ip)
+        ) or {"ok": True, "outcome": ctrl.OUTCOME_SUCCESS}
+
+        handler = ctrl.Handler.__new__(ctrl.Handler)
+        handler.path = "/repair"
+        handler.headers = {"X-Chamosel-Auth": "controller-token"}
+        handler._json = lambda code, payload: captured.update({"code": code, "payload": payload})
+
+        handler.do_POST()
+
+        self.assertEqual(200, captured["code"])
+        self.assertEqual("repair_attempted", captured["payload"]["outcome"])
+        self.assertEqual("vpn_0", captured["payload"]["target"])
+        self.assertEqual([("vpn_0", False, None)], calls)
+
+    def test_repair_selected_endpoint_rotates_selected_backend_only(self):
+        ctrl = load_controller(
+            self.tmp.name,
+            env_overrides={"CONTROLLER_AUTH_ENABLED": "true", "CONTROLLER_AUTH_TOKEN": "controller-token"},
+        )
+        calls = []
+        captured = {}
+
+        ctrl.STATE.update_health("vpn_0", True, "1.1.1.1", status=ctrl.STATUS_HEALTHY)
+        ctrl.STATE.record_rotation("vpn_0", ctrl.OUTCOME_PROXY_FAILURE)
+        ctrl.STATE.update_health("vpn_1", True, "2.2.2.2", status=ctrl.STATUS_HEALTHY)
+        ctrl.rotate_instance = lambda instance, force=False, repair_duplicate_ip=None: calls.append(
+            (instance, force, repair_duplicate_ip)
+        ) or {"ok": True, "outcome": ctrl.OUTCOME_SUCCESS}
+
+        handler = ctrl.Handler.__new__(ctrl.Handler)
+        handler.path = "/repair/vpn_1"
+        handler.headers = {"X-Chamosel-Auth": "controller-token"}
+        handler._json = lambda code, payload: captured.update({"code": code, "payload": payload})
+
+        handler.do_POST()
+
+        self.assertEqual(200, captured["code"])
+        self.assertEqual("selected_instance", captured["payload"]["reason"])
+        self.assertEqual("vpn_1", captured["payload"]["target"])
+        self.assertEqual([("vpn_1", False, None)], calls)
+
     def test_metrics_expose_latest_outcome_and_cooldown(self):
         self.ctrl.STATE.start_cooldown("vpn_0", self.ctrl.OUTCOME_RECOVERY_TIMEOUT)
         self.ctrl.STATE.record_rotation("vpn_0", self.ctrl.OUTCOME_RECOVERY_TIMEOUT)
@@ -833,6 +918,18 @@ class ControllerTests(unittest.TestCase):
 
         self.assertIn("recovery_timeout", html)
         self.assertIn("cooldown", html)
+
+    def test_dashboard_exposes_refresh_control_selection_and_proxy_failure_state(self):
+        self.ctrl.STATE.update_health("vpn_0", True, "1.1.1.1", status=self.ctrl.STATUS_HEALTHY)
+        self.ctrl.STATE.record_rotation("vpn_0", self.ctrl.OUTCOME_PROXY_FAILURE)
+
+        html = self.ctrl.render_dashboard()
+
+        self.assertIn('id="refreshSeconds"', html)
+        self.assertIn('name="instance"', html)
+        self.assertIn("Repair selected", html)
+        self.assertIn("Rotate selected", html)
+        self.assertIn("proxy_failure", html)
 
 
 if __name__ == "__main__":

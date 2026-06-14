@@ -215,6 +215,7 @@ class GenerateTests(unittest.TestCase):
         cfg["global_settings"]["egress_verify_timeout"] = 12
         cfg["global_settings"]["egress_verify_ttl"] = 90
         cfg["global_settings"]["egress_verify_on_fresh"] = False
+        cfg["global_settings"]["dashboard_refresh_seconds"] = 15
 
         self.chamosel.generate(cfg)
         compose = yaml.safe_load(Path("docker-compose.yml").read_text())
@@ -228,6 +229,7 @@ class GenerateTests(unittest.TestCase):
         self.assertEqual("https://ifconfig.co/json", env["EGRESS_VERIFY_TARGET"])
         self.assertEqual("12", env["EGRESS_VERIFY_TIMEOUT"])
         self.assertEqual("90", env["EGRESS_VERIFY_TTL"])
+        self.assertEqual("15", env["DASHBOARD_REFRESH_SECONDS"])
         self.assertEqual("false", env["EGRESS_VERIFY_ON_FRESH"])
         self.assertEqual("false", env["CONTROLLER_AUTH_ENABLED"])
 

@@ -52,6 +52,7 @@ Endpoints:
 """
 
 import hmac
+import html
 import json
 import os
 import ipaddress
@@ -85,6 +86,7 @@ EGRESS_VERIFY_TARGET = os.environ.get("EGRESS_VERIFY_TARGET", "https://ifconfig.
 EGRESS_VERIFY_TIMEOUT = max(1, int(os.environ.get("EGRESS_VERIFY_TIMEOUT", "10")))
 EGRESS_VERIFY_TTL = max(0, int(os.environ.get("EGRESS_VERIFY_TTL", "120")))
 EGRESS_VERIFY_ON_FRESH = os.environ.get("EGRESS_VERIFY_ON_FRESH", "true").strip().lower() not in ("0", "false", "no", "off")
+DASHBOARD_REFRESH_SECONDS = max(0, int(os.environ.get("DASHBOARD_REFRESH_SECONDS", "5")))
 CONTROLLER_AUTH_ENABLED = os.environ.get("CONTROLLER_AUTH_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
 CONTROLLER_AUTH_TOKEN = os.environ.get("CONTROLLER_AUTH_TOKEN", "").strip()
 CONTROLLER_AUTH_HEADER = "X-Chamosel-Auth"
@@ -495,6 +497,24 @@ def duplicate_public_ips(instances: list[dict]) -> set[str]:
     }
 
 
+def instance_proxy_degraded(s: dict) -> bool:
+    if not s.get("healthy"):
+        return False
+    if s.get("verified_proxy_ip_error") and not s.get("egress_state_fresh"):
+        return True
+    return s.get("last_rotation_outcome") == OUTCOME_PROXY_FAILURE and not s.get("egress_state_fresh")
+
+
+def instance_display_state(s: dict) -> tuple[str, str]:
+    if not s.get("healthy"):
+        return s.get("status") or STATUS_UNREACHABLE, "#ef4444"
+    if instance_proxy_degraded(s):
+        return OUTCOME_PROXY_FAILURE, "#f59e0b"
+    if s.get("last_rotation_outcome") in (OUTCOME_RECOVERY_TIMEOUT, OUTCOME_HEALTHY_IP_UNCHANGED):
+        return s.get("last_rotation_outcome"), "#f59e0b"
+    return s.get("status") or STATUS_HEALTHY, "#22c55e"
+
+
 def duplicate_repair_snapshot() -> dict:
     now = time.time()
     with DUPLICATE_REPAIR_LOCK:
@@ -532,7 +552,7 @@ def pool_summary(instances: list[dict]) -> tuple[str, list[str], bool]:
     latest_outcomes = {s.get("last_rotation_outcome") for s in instances}
     if OUTCOME_RECOVERY_TIMEOUT in latest_outcomes:
         reasons.append(DEGRADED_RECOVERY_TIMEOUT)
-    if OUTCOME_PROXY_FAILURE in latest_outcomes:
+    if any(instance_proxy_degraded(s) for s in instances):
         reasons.append(DEGRADED_PROXY_FAILURE)
     if OUTCOME_HEALTHY_IP_UNCHANGED in latest_outcomes:
         reasons.append(DEGRADED_HEALTHY_IP_UNCHANGED)
@@ -735,6 +755,29 @@ def select_duplicate_repair_candidate(snap: dict) -> tuple[str | None, str | Non
     return None, None
 
 
+def select_proxy_failure_repair_candidate(snap: dict) -> tuple[str | None, str | None]:
+    now = time.time()
+    candidates = []
+    for s in snap.get("instances") or []:
+        if not instance_proxy_degraded(s):
+            continue
+        name = s["name"]
+        if STATE.cooldown_remaining(name) > 0:
+            continue
+        with DUPLICATE_REPAIR_LOCK:
+            if name in DUPLICATE_REPAIR_IN_FLIGHT:
+                continue
+            if DUPLICATE_REPAIR_BACKOFF_UNTIL.get(name, 0.0) > now:
+                continue
+        candidates.append(s)
+    candidates.sort(key=lambda s: (s.get("last_rotated") or 0, s["name"]))
+    if not candidates:
+        return None, None
+    target = candidates[0]
+    reason = DEGRADED_EGRESS_VERIFICATION_FAILED if target.get("verified_proxy_ip_error") else DEGRADED_PROXY_FAILURE
+    return target["name"], reason
+
+
 def duplicate_repair_worker(instance: str, duplicate_ip: str):
     try:
         log(f"duplicate-egress repair: rotating {instance} from duplicated IP {duplicate_ip}")
@@ -750,8 +793,48 @@ def duplicate_repair_worker(instance: str, duplicate_ip: str):
             DUPLICATE_REPAIR_IN_FLIGHT.discard(instance)
 
 
-def repair_duplicate_ip_once() -> dict:
+def repair_rotation_target(instance: str, reason: str, repair_duplicate_ip: str | None = None) -> dict:
     global DUPLICATE_REPAIR_SCHEDULED_TOTAL
+    with DUPLICATE_REPAIR_LOCK:
+        if instance in DUPLICATE_REPAIR_IN_FLIGHT:
+            in_progress = True
+        else:
+            in_progress = False
+            DUPLICATE_REPAIR_IN_FLIGHT.add(instance)
+            DUPLICATE_REPAIR_SCHEDULED_TOTAL += 1
+    if in_progress:
+        return {
+            "ok": False,
+            "attempted": False,
+            "outcome": "repair_in_progress",
+            "reason": reason,
+            "target": instance,
+            "duplicate_repair": duplicate_repair_snapshot(),
+        }
+    result = None
+    try:
+        result = rotate_instance(instance, force=False, repair_duplicate_ip=repair_duplicate_ip)
+        with DUPLICATE_REPAIR_LOCK:
+            if result.get("ok"):
+                DUPLICATE_REPAIR_BACKOFF_UNTIL.pop(instance, None)
+            elif DUPLICATE_REPAIR_RETRY_COOLDOWN > 0:
+                DUPLICATE_REPAIR_BACKOFF_UNTIL[instance] = time.time() + DUPLICATE_REPAIR_RETRY_COOLDOWN
+    finally:
+        with DUPLICATE_REPAIR_LOCK:
+            DUPLICATE_REPAIR_IN_FLIGHT.discard(instance)
+    return {
+        "ok": bool(result.get("ok")),
+        "attempted": True,
+        "outcome": "repair_attempted",
+        "reason": reason,
+        "target": instance,
+        "duplicate_ip": repair_duplicate_ip,
+        "rotation": result,
+        "duplicate_repair": duplicate_repair_snapshot(),
+    }
+
+
+def repair_duplicate_ip_once() -> dict:
     if not AUTO_REPAIR_DUPLICATE_IPS:
         return {
             "ok": False,
@@ -790,45 +873,40 @@ def repair_duplicate_ip_once() -> dict:
             "duplicate_repair": duplicate_repair_snapshot(),
         }
 
-    with DUPLICATE_REPAIR_LOCK:
-        if instance in DUPLICATE_REPAIR_IN_FLIGHT:
-            in_progress = True
-        else:
-            in_progress = False
-            DUPLICATE_REPAIR_IN_FLIGHT.add(instance)
-            DUPLICATE_REPAIR_SCHEDULED_TOTAL += 1
-    if in_progress:
+    return repair_rotation_target(instance, duplicate_reason, repair_duplicate_ip=duplicate_ip)
+
+
+def repair_pool_once() -> dict:
+    duplicate = repair_duplicate_ip_once()
+    if duplicate.get("attempted") or duplicate.get("outcome") in ("repair_in_progress", "blocked"):
+        return duplicate
+
+    snap = STATE.snapshot()
+    instance, reason = select_proxy_failure_repair_candidate(snap)
+    if not instance:
+        return {
+            "ok": True,
+            "attempted": False,
+            "outcome": "none",
+            "reason": "no_repairable_degraded_backend",
+            "message": "no duplicate IP or proxy-failed backend is currently repairable",
+            "duplicate_repair": duplicate_repair_snapshot(),
+        }
+    return repair_rotation_target(instance, reason)
+
+
+def repair_selected_instance(instance: str) -> dict:
+    if instance not in INSTANCES:
         return {
             "ok": False,
             "attempted": False,
-            "outcome": "repair_in_progress",
-            "reason": duplicate_reason,
+            "outcome": OUTCOME_UNKNOWN_INSTANCE,
+            "reason": "selected_instance",
             "target": instance,
-            "duplicate_ip": duplicate_ip,
+            "message": "unknown instance",
             "duplicate_repair": duplicate_repair_snapshot(),
         }
-
-    result = None
-    try:
-        result = rotate_instance(instance, force=False, repair_duplicate_ip=duplicate_ip)
-        with DUPLICATE_REPAIR_LOCK:
-            if result.get("ok"):
-                DUPLICATE_REPAIR_BACKOFF_UNTIL.pop(instance, None)
-            elif DUPLICATE_REPAIR_RETRY_COOLDOWN > 0:
-                DUPLICATE_REPAIR_BACKOFF_UNTIL[instance] = time.time() + DUPLICATE_REPAIR_RETRY_COOLDOWN
-    finally:
-        with DUPLICATE_REPAIR_LOCK:
-            DUPLICATE_REPAIR_IN_FLIGHT.discard(instance)
-    return {
-        "ok": bool(result.get("ok")),
-        "attempted": True,
-        "outcome": "repair_attempted",
-        "reason": duplicate_reason,
-        "target": instance,
-        "duplicate_ip": duplicate_ip,
-        "rotation": result,
-        "duplicate_repair": duplicate_repair_snapshot(),
-    }
+    return repair_rotation_target(instance, "selected_instance")
 
 
 def maybe_schedule_duplicate_ip_repair():
@@ -1264,31 +1342,35 @@ def render_dashboard() -> str:
         POOL_STATUS_DOWN: "#ef4444",
     }.get(pool_status, "#9ca3af")
     degraded = ", ".join(snap.get("degraded_reasons") or []) or "-"
-    for s in snap["instances"]:
-        dot = "#22c55e" if s["healthy"] else "#ef4444"
+    for index, s in enumerate(snap["instances"]):
+        state, dot = instance_display_state(s)
         last_rot = "never" if not s["last_rotated"] else f"{int(now - s['last_rotated'])}s ago"
         hist = ", ".join(s["ip_history"][:5]) or "-"
-        state = s.get("status") or ("healthy" if s["healthy"] else "down")
         outcome = s.get("last_rotation_outcome") or "-"
         mismatch = "yes" if s.get("public_ip_mismatch") else "no"
         cooldown = s.get("cooldown_remaining_seconds") or 0
         cooldown_text = f"{cooldown:.0f}s ({s.get('cooldown_reason')})" if cooldown > 0 else "-"
+        name = html.escape(s["name"], quote=True)
         rows.append(
-            f'<tr><td><span class="dot" style="background:{dot}"></span>{s["name"]}</td>'
-            f'<td>{state}</td>'
+            f'<tr><td><input type="radio" name="instance" value="{name}" {"checked" if index == 0 else ""}></td>'
+            f'<td><span class="dot" style="background:{dot}"></span>{name}</td>'
+            f'<td>{html.escape(str(state))}</td>'
             f'<td>{"yes" if s.get("state_fresh") else "no"}</td>'
-            f'<td class="ip">{s["public_ip"] or "-"}</td>'
-            f'<td class="ip">{s.get("verified_proxy_ip") or "-"}</td>'
+            f'<td class="ip">{html.escape(str(s["public_ip"] or "-"))}</td>'
+            f'<td class="ip">{html.escape(str(s.get("verified_proxy_ip") or "-"))}</td>'
             f'<td>{mismatch}</td>'
             f'<td>{s["rotations"]}</td><td>{last_rot}</td>'
-            f'<td>{outcome}</td><td>{cooldown_text}</td>'
-            f'<td class="hist">{hist}</td></tr>'
+            f'<td>{html.escape(str(outcome))}</td><td>{html.escape(cooldown_text)}</td>'
+            f'<td class="hist">{html.escape(hist)}</td></tr>'
         )
     return f"""<!doctype html><html><head><meta charset="utf-8">
-<meta http-equiv="refresh" content="5"><title>chamosel</title>
+<title>chamosel</title>
 <style>
   body{{font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;background:#0b0f19;color:#e5e7eb;margin:0;padding:24px}}
   h1{{font-size:18px;margin:0 0 4px}} .sub{{color:#9ca3af;margin:0 0 20px}}
+  .bar{{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:0 0 16px}}
+  .bar label{{color:#9ca3af}}
+  input[type=number]{{width:72px;background:#020617;color:#e5e7eb;border:1px solid #334155;border-radius:8px;padding:7px 9px;font:inherit}}
   .cards{{display:flex;gap:12px;margin-bottom:20px;flex-wrap:wrap}}
   .card{{background:#111827;border:1px solid #1f2937;border-radius:10px;padding:12px 16px;min-width:120px}}
   .card .n{{font-size:24px;font-weight:600}} .card .l{{color:#9ca3af;font-size:12px}}
@@ -1301,7 +1383,12 @@ def render_dashboard() -> str:
   button{{background:#2563eb;color:#fff;border:0;border-radius:8px;padding:8px 14px;cursor:pointer;font:inherit}}
   button:hover{{background:#1d4ed8}}
 </style></head><body>
-<h1>chamosel</h1><p class="sub">spin the wheel, change the skin · auto-refresh 5s</p>
+<h1>chamosel</h1><p class="sub">spin the wheel, change the skin</p>
+<div class="bar">
+  <label>auto-refresh <input id="refreshSeconds" type="number" min="0" max="3600" step="1"> seconds</label>
+  <button onclick="saveRefresh()">Apply</button>
+  <button onclick="location.reload()">Refresh now</button>
+</div>
 <div class="cards">
   <div class="card"><div class="n">{snap['count']}</div><div class="l">instances</div></div>
   <div class="card"><div class="n">{snap['healthy']}</div><div class="l">healthy</div></div>
@@ -1311,11 +1398,53 @@ def render_dashboard() -> str:
   <div class="card"><div class="n">{snap['rotation_errors_total']}</div><div class="l">rot. errors</div></div>
 </div>
 <p class="sub">degraded reasons: {degraded}</p>
-<p><button onclick="fetch('/rotate',{{method:'POST'}}).then(()=>setTimeout(()=>location.reload(),1200))">Rotate one</button></p>
+<p>
+  <button onclick="repairSelected()">Repair selected</button>
+  <button onclick="rotateSelected()">Rotate selected</button>
+  <button onclick="rotateAny()">Rotate one</button>
+</p>
 <table>
-  <tr><th>instance</th><th>state</th><th>fresh</th><th>public ip</th><th>verified proxy ip</th><th>mismatch</th><th>rotations</th><th>last rotated</th><th>outcome</th><th>cooldown</th><th>recent ips</th></tr>
+  <tr><th>select</th><th>instance</th><th>state</th><th>fresh</th><th>public ip</th><th>verified proxy ip</th><th>mismatch</th><th>rotations</th><th>last rotated</th><th>outcome</th><th>cooldown</th><th>recent ips</th></tr>
   {''.join(rows)}
-</table></body></html>"""
+</table>
+<script>
+const defaultRefreshSeconds = {DASHBOARD_REFRESH_SECONDS};
+const refreshInput = document.getElementById("refreshSeconds");
+const storedRefresh = localStorage.getItem("chamosel.refreshSeconds");
+refreshInput.value = storedRefresh !== null ? storedRefresh : String(defaultRefreshSeconds);
+function currentRefreshSeconds() {{
+  const value = Number.parseInt(refreshInput.value || "0", 10);
+  return Number.isFinite(value) && value > 0 ? value : 0;
+}}
+function saveRefresh() {{
+  localStorage.setItem("chamosel.refreshSeconds", String(currentRefreshSeconds()));
+  location.reload();
+}}
+const refreshSeconds = currentRefreshSeconds();
+if (refreshSeconds > 0) {{
+  window.setTimeout(() => location.reload(), refreshSeconds * 1000);
+}}
+function reloadSoon() {{
+  window.setTimeout(() => location.reload(), 1200);
+}}
+function selectedInstance() {{
+  const selected = document.querySelector('input[name="instance"]:checked');
+  return selected ? selected.value : "";
+}}
+function rotateSelected() {{
+  const instance = selectedInstance();
+  if (!instance) return;
+  fetch(`/rotate/${{encodeURIComponent(instance)}}?force=0`, {{method:'POST'}}).then(reloadSoon);
+}}
+function repairSelected() {{
+  const instance = selectedInstance();
+  if (!instance) return;
+  fetch(`/repair/${{encodeURIComponent(instance)}}`, {{method:'POST'}}).then(reloadSoon);
+}}
+function rotateAny() {{
+  fetch('/rotate', {{method:'POST'}}).then(reloadSoon);
+}}
+</script></body></html>"""
 
 
 # --------------------------------------------------------------------------- #
@@ -1369,14 +1498,20 @@ class Handler(BaseHTTPRequestHandler):
             return
         if not INSTANCES:
             return self._json(503, {"error": "no instances configured"})
-        if self.path == "/rotate":
+        parsed = urlparse(self.path)
+        if parsed.path == "/rotate":
             self._json(200, rotate_one_random())
-        elif self.path == "/rotate/all":
+        elif parsed.path == "/rotate/all":
             self._json(200, rotate_all())
-        elif self.path == "/repair/duplicate-ip":
+        elif parsed.path == "/repair":
+            self._json(200, repair_pool_once())
+        elif parsed.path == "/repair/duplicate-ip":
             self._json(200, repair_duplicate_ip_once())
-        elif self.path.startswith("/rotate/"):
-            self._json(200, rotate_instance(self.path[len("/rotate/"):], force=True))
+        elif parsed.path.startswith("/repair/"):
+            self._json(200, repair_selected_instance(parsed.path[len("/repair/"):]))
+        elif parsed.path.startswith("/rotate/"):
+            force = parse_qs(parsed.query).get("force", ["1"])[0].strip().lower() not in ("0", "false", "no", "off")
+            self._json(200, rotate_instance(parsed.path[len("/rotate/"):], force=force))
         else:
             self._json(404, {"error": "not found"})
 

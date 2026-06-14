@@ -646,7 +646,7 @@ class VerifyLeakTests(unittest.TestCase):
                     },
                     "error": None,
                 }
-            if path == "/repair/duplicate-ip":
+            if path == "/repair":
                 return {
                     "ok": True,
                     "status": 200,
@@ -660,7 +660,7 @@ class VerifyLeakTests(unittest.TestCase):
         report = self.chamosel.doctor_report(cfg, repair=True)
         rendered = self.chamosel.render_doctor_report(report)
 
-        self.assertIn(("POST", "/repair/duplicate-ip"), calls)
+        self.assertIn(("POST", "/repair"), calls)
         self.assertEqual("repair_attempted", report["repair_result"]["payload"]["outcome"])
         self.assertIn("Repair result: repair_attempted", rendered)
         self.assertNotIn("controller-secret", json.dumps(report))
@@ -694,7 +694,7 @@ class VerifyLeakTests(unittest.TestCase):
 
         report = self.chamosel.doctor_report(self.cfg, repair=True)
 
-        self.assertNotIn(("POST", "/repair/duplicate-ip"), calls)
+        self.assertNotIn(("POST", "/repair"), calls)
         self.assertEqual("monitor", report["repair_decision"]["action"])
         self.assertEqual("skipped", report["repair_result"]["payload"]["outcome"])
 
@@ -728,18 +728,27 @@ class VerifyLeakTests(unittest.TestCase):
         self.assertEqual("monitor", decision["action"])
         self.assertEqual("public_ip_mismatch", decision["reason"])
 
-    def test_doctor_reports_egress_verification_failure_as_manual(self):
+    def test_doctor_reports_egress_verification_failure_as_repair_requested(self):
         decision = self.chamosel.doctor_repair_decision(
             True,
             {
                 "pool_status": "degraded",
                 "degraded_reasons": ["egress_verification_failed"],
                 "duplicate_repair": {"enabled": True},
+                "instances": [
+                    {
+                        "name": "surfshark_2",
+                        "healthy": True,
+                        "verified_proxy_ip_error": "timeout",
+                        "egress_state_fresh": False,
+                    }
+                ],
             },
         )
 
-        self.assertEqual("manual", decision["action"])
-        self.assertEqual("egress_verification_failed", decision["reason"])
+        self.assertEqual("repair_requested", decision["action"])
+        self.assertEqual("proxy_failure", decision["reason"])
+        self.assertEqual(["surfshark_2"], decision["targets"])
 
     def test_doctor_reports_duplicate_ip_repair_backoff(self):
         decision = self.chamosel.doctor_repair_decision(
