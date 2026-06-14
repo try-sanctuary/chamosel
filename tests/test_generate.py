@@ -118,6 +118,24 @@ class GenerateTests(unittest.TestCase):
         self.assertNotIn("proxy-client-net", compose["services"]["controller"]["networks"])
         self.assertNotIn("proxy-client-net", compose["services"]["surfshark_0"]["networks"])
 
+    def test_proxy_publish_false_uses_client_network_without_host_proxy_port(self):
+        cfg = self.base_config()
+        cfg["global_settings"]["proxy_publish"] = False
+        cfg["global_settings"]["proxy_bind"] = "0.0.0.0"
+        cfg["global_settings"]["proxy_port"] = 8890
+        cfg["global_settings"]["proxy_client_network_name"] = "chamosel-clients"
+
+        self.chamosel.generate(cfg)
+        compose = yaml.safe_load(Path("docker-compose.yml").read_text())
+
+        self.assertNotIn("0.0.0.0:8890:8890/tcp", compose["services"]["haproxy"]["ports"])
+        self.assertNotIn("8890:8890/tcp", compose["services"]["haproxy"]["ports"])
+        self.assertIn("127.0.0.1:8404:8404/tcp", compose["services"]["haproxy"]["ports"])
+        self.assertEqual(
+            {"aliases": ["chamosel-proxy"]},
+            compose["services"]["haproxy"]["networks"]["proxy-client-net"],
+        )
+
     def test_proxy_client_network_empty_alias_uses_default(self):
         cfg = self.base_config()
         cfg["global_settings"]["proxy_client_network_name"] = "chamosel-clients"
@@ -165,6 +183,16 @@ class GenerateTests(unittest.TestCase):
         rendered = "\n".join(logs.output)
         self.assertIn("allow_public_proxy", rendered)
         self.assertNotIn("config-secret", rendered)
+
+    def test_proxy_publish_false_does_not_require_public_proxy_allowlist(self):
+        cfg = self.base_config()
+        cfg["global_settings"]["proxy_publish"] = False
+        cfg["global_settings"]["proxy_bind"] = "0.0.0.0"
+
+        self.chamosel.generate(cfg)
+        compose = yaml.safe_load(Path("docker-compose.yml").read_text())
+
+        self.assertNotIn("0.0.0.0:8888:8888/tcp", compose["services"]["haproxy"]["ports"])
 
     def test_public_stats_requires_auth_or_allowlist(self):
         cfg = self.base_config()
@@ -408,6 +436,25 @@ class GenerateTests(unittest.TestCase):
         self.assertIn("Proxy http://10.20.20.5:8890", rendered_logs)
         self.assertIn("API+dashboard http://10.20.20.3:8801", rendered_logs)
         self.assertIn("Stats http://10.20.20.4:8405/stats", rendered_logs)
+
+    def test_cmd_up_logs_client_network_proxy_when_host_publish_disabled(self):
+        cfg = self.base_config()
+        cfg["global_settings"].update(
+            {
+                "proxy_publish": False,
+                "proxy_port": 8890,
+                "proxy_client_network_name": "chamosel-clients",
+                "proxy_client_network_alias": "chamosel-proxy",
+            }
+        )
+        self.chamosel.generate = lambda cfg: None
+        self.chamosel.compose_cmd = lambda args, capture=False: None
+
+        with self.assertLogs("chamosel", level="INFO") as logs:
+            self.chamosel.cmd_up(cfg, pull_images=False)
+
+        rendered_logs = "\n".join(logs.output)
+        self.assertIn("Proxy http://chamosel-proxy:8890 (network chamosel-clients)", rendered_logs)
 
     def test_controller_stats_url_uses_configured_stats_bind(self):
         cfg = self.base_config()

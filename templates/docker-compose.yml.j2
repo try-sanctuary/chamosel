@@ -47,7 +47,9 @@ services:
     tmpfs:
       - /tmp
     ports:
+{% if proxy_publish == "true" %}
       - "{{ proxy_bind }}:{{ proxy_port }}:{{ proxy_port }}/tcp"
+{% endif %}
       - "{{ stats_bind }}:{{ stats_port }}:{{ stats_port }}/tcp"
     restart: unless-stopped
     volumes:

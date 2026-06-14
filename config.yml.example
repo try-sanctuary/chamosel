@@ -1,5 +1,6 @@
 global_settings:
   proxy_port: 8888          # request clients point here
+  proxy_publish: true       # set false to use only proxy_client_network_name without host publishing
   proxy_bind: 127.0.0.1     # proxy host bind; non-loopback requires allow_public_proxy + CIDR allowlist
   api_bind: 127.0.0.1       # controller API/dashboard host bind; use 0.0.0.0 only behind firewall/auth
   stats_port: 8404          # HAProxy stats UI at /stats

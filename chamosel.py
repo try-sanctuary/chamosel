@@ -61,6 +61,7 @@ CONTROLLER_PORT = 8800
 
 DEFAULTS = {
     "proxy_port": 8888,
+    "proxy_publish": True,
     "proxy_bind": "127.0.0.1",
     "api_bind": "127.0.0.1",
     "stats_bind": "127.0.0.1",
@@ -466,6 +467,7 @@ def validate_exposure_policy(cfg: dict):
     api_bind = gset(cfg, "api_bind")
     proxy_bind = gset(cfg, "proxy_bind")
     stats_bind = gset(cfg, "stats_bind")
+    proxy_publish = truthy(gset(cfg, "proxy_publish"))
 
     if is_non_loopback_bind(api_bind) and not controller_auth_enabled(cfg):
         log.error(
@@ -475,7 +477,7 @@ def validate_exposure_policy(cfg: dict):
         )
         sys.exit(1)
 
-    if is_non_loopback_bind(proxy_bind):
+    if proxy_publish and is_non_loopback_bind(proxy_bind):
         if not truthy(gset(cfg, "allow_public_proxy")):
             log.error(
                 "Refusing to publish the request proxy on %s without allow_public_proxy=true "
@@ -537,6 +539,7 @@ def generate(cfg: dict):
         image=gset(cfg, "image"),
         haproxy_image=gset(cfg, "haproxy_image"),
         env_file=gset(cfg, "env_file"),
+        proxy_publish=str(truthy(gset(cfg, "proxy_publish"))).lower(),
         proxy_bind=gset(cfg, "proxy_bind"),
         proxy_client_network_name=proxy_client_network["name"],
         proxy_client_network_external=str(proxy_client_network["external"]).lower(),
@@ -1654,13 +1657,19 @@ def cmd_up(cfg, pull_images: bool = True):
     else:
         log.info("Skipping image pull (--no-pull)")
     compose_cmd(["up", "-d", "--build", "--remove-orphans", "--force-recreate"])
-    proxy_host = display_host(gset(cfg, "proxy_bind"))
+    if truthy(gset(cfg, "proxy_publish")):
+        proxy_target = f"http://{display_host(gset(cfg, 'proxy_bind'))}:{gset(cfg, 'proxy_port')}"
+    else:
+        client_network = proxy_client_network_config(cfg)
+        if client_network["name"]:
+            proxy_target = f"http://{client_network['alias']}:{gset(cfg, 'proxy_port')} (network {client_network['name']})"
+        else:
+            proxy_target = "not published"
     api_host = display_host(gset(cfg, "api_bind"))
     stats_host = display_host(gset(cfg, "stats_bind"))
     log.info(
-        "Pool up. Proxy http://%s:%s | API+dashboard http://%s:%s | Stats http://%s:%s/stats",
-        proxy_host,
-        gset(cfg, "proxy_port"),
+        "Pool up. Proxy %s | API+dashboard http://%s:%s | Stats http://%s:%s/stats",
+        proxy_target,
         api_host,
         gset(cfg, "api_port"),
         stats_host,
