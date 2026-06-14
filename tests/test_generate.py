@@ -230,6 +230,7 @@ class GenerateTests(unittest.TestCase):
         self.assertEqual("12", env["EGRESS_VERIFY_TIMEOUT"])
         self.assertEqual("90", env["EGRESS_VERIFY_TTL"])
         self.assertEqual("15", env["DASHBOARD_REFRESH_SECONDS"])
+        self.assertEqual("http://127.0.0.1:8404/stats", env["DASHBOARD_STATS_URL"])
         self.assertEqual("false", env["EGRESS_VERIFY_ON_FRESH"])
         self.assertEqual("false", env["CONTROLLER_AUTH_ENABLED"])
 
@@ -285,6 +286,17 @@ class GenerateTests(unittest.TestCase):
         self.assertIn("Proxy http://10.20.20.3:8890", rendered_logs)
         self.assertIn("API+dashboard http://10.20.20.3:8801", rendered_logs)
         self.assertIn("Stats http://10.20.20.4:8405/stats", rendered_logs)
+
+    def test_controller_stats_url_uses_configured_stats_bind(self):
+        cfg = self.base_config()
+        cfg["global_settings"]["stats_bind"] = "10.20.20.4"
+        cfg["global_settings"]["stats_port"] = 8405
+
+        self.chamosel.generate(cfg)
+        compose = yaml.safe_load(Path("docker-compose.yml").read_text())
+        env = compose["services"]["controller"]["environment"]
+
+        self.assertEqual("http://10.20.20.4:8405/stats", env["DASHBOARD_STATS_URL"])
 
     def test_compose_cmd_sanitizes_missing_plugin_help_output(self):
         leaked_help = (

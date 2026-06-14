@@ -342,7 +342,7 @@ class ControllerTests(unittest.TestCase):
             metrics,
         )
 
-    def test_new_rotation_state_defaults_and_persistence(self):
+    def test_new_rotation_state_defaults_and_runtime_reset_on_reload(self):
         snap = self.ctrl.STATE.snapshot()
         state = snap["instances"][0]
 
@@ -368,11 +368,14 @@ class ControllerTests(unittest.TestCase):
 
         reloaded = self.ctrl.State()
         persisted = reloaded.snapshot()["instances"][0]
-        self.assertEqual(self.ctrl.OUTCOME_RECOVERY_TIMEOUT, persisted["last_rotation_outcome"])
-        self.assertEqual("safe message", persisted["last_rotation_message"])
-        self.assertEqual("1.1.1.1", persisted["last_rotation_old_ip"])
-        self.assertGreater(persisted["cooldown_until"], time.time())
-        self.assertEqual(self.ctrl.OUTCOME_RECOVERY_TIMEOUT, persisted["cooldown_reason"])
+        reloaded_snap = reloaded.snapshot()
+        self.assertEqual(0, reloaded_snap["rotations_total"])
+        self.assertEqual(0, reloaded_snap["rotation_errors_total"])
+        self.assertIsNone(persisted["last_rotation_outcome"])
+        self.assertIsNone(persisted["last_rotation_message"])
+        self.assertIsNone(persisted["last_rotation_old_ip"])
+        self.assertEqual(0.0, persisted["cooldown_until"])
+        self.assertIsNone(persisted["cooldown_reason"])
         self.assertFalse(persisted["state_fresh"])
 
     def test_loaded_state_is_stale_until_refreshed(self):
@@ -1067,6 +1070,17 @@ class ControllerTests(unittest.TestCase):
         self.assertIn("<th>city</th>", html)
         self.assertIn("Germany", html)
         self.assertIn("Berlin", html)
+
+    def test_dashboard_exposes_stats_button_when_url_configured(self):
+        ctrl = load_controller(
+            self.tmp.name,
+            env_overrides={"DASHBOARD_STATS_URL": "http://10.20.20.4:8405/stats"},
+        )
+
+        html = ctrl.render_dashboard()
+
+        self.assertIn(">Stats</button>", html)
+        self.assertIn("http://10.20.20.4:8405/stats", html)
 
 
 if __name__ == "__main__":

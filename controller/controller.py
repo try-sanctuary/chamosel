@@ -37,6 +37,7 @@ Environment:
   EGRESS_VERIFY_TTL max age for verified proxy IP cache seconds (120)
   EGRESS_VERIFY_ON_FRESH verify backend proxy egress during /pool?fresh=1 (true)
   POLL_INTERVAL        background health/IP poll interval seconds (default 15)
+  DASHBOARD_STATS_URL  optional HAProxy stats URL shown in the dashboard
   POLL_WORKERS         max concurrent instance polls (default min(16, pool size))
   STATE_FILE           path to persist state JSON (default /data/state.json)
 
@@ -88,6 +89,7 @@ EGRESS_VERIFY_TIMEOUT = max(1, int(os.environ.get("EGRESS_VERIFY_TIMEOUT", "10")
 EGRESS_VERIFY_TTL = max(0, int(os.environ.get("EGRESS_VERIFY_TTL", "120")))
 EGRESS_VERIFY_ON_FRESH = os.environ.get("EGRESS_VERIFY_ON_FRESH", "true").strip().lower() not in ("0", "false", "no", "off")
 DASHBOARD_REFRESH_SECONDS = max(0, int(os.environ.get("DASHBOARD_REFRESH_SECONDS", "5")))
+DASHBOARD_STATS_URL = os.environ.get("DASHBOARD_STATS_URL", "").strip()
 CONTROLLER_AUTH_ENABLED = os.environ.get("CONTROLLER_AUTH_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
 CONTROLLER_AUTH_TOKEN = os.environ.get("CONTROLLER_AUTH_TOKEN", "").strip()
 CONTROLLER_AUTH_HEADER = "X-Chamosel-Auth"
@@ -231,23 +233,14 @@ class State:
                 saved = json.load(fh)
             for name, s in saved.get("inst", {}).items():
                 if name in self.inst:
-                    for k in ("ip_history", "rotations", "rotation_errors",
-                              "last_rotated", "public_ip", "status_path",
-                              "status", "last_error", "last_rotation_outcome",
-                              "rotation_errors_by_outcome", "last_rotation_attempted",
-                              "last_rotation_message", "last_rotation_old_ip",
-                              "last_rotation_new_ip", "cooldown_started_at",
-                              "cooldown_until", "cooldown_reason",
-                              "cooldown_attempt_count", "forced_bypass_count",
+                    for k in ("ip_history", "public_ip", "status_path",
+                              "status", "last_error",
                               "verified_proxy_ip", "verified_proxy_ip_seen_at",
                               "verified_proxy_ip_error", "country", "city",
                               "geo_source"):
                         if k in s:
                             self.inst[name][k] = s[k]
                     self.inst[name]["state_fresh"] = False
-            self.rotations_total = saved.get("rotations_total", 0)
-            self.rotation_errors_total = saved.get("rotation_errors_total", 0)
-            self.rotation_errors_by_outcome = saved.get("rotation_errors_by_outcome", {})
             log(f"loaded state from {STATE_FILE}")
         except FileNotFoundError:
             pass
@@ -1425,6 +1418,11 @@ def render_dashboard() -> str:
     }.get(pool_status, "#9ca3af")
     degraded = ", ".join(snap.get("degraded_reasons") or []) or "-"
     auto_repair_enabled = bool((snap.get("duplicate_repair") or {}).get("enabled"))
+    stats_button = (
+        f"<button onclick='window.open({json.dumps(DASHBOARD_STATS_URL)}, \"_blank\", \"noopener\")'>Stats</button>"
+        if DASHBOARD_STATS_URL
+        else ""
+    )
     for index, s in enumerate(snap["instances"]):
         state, dot = instance_display_state(s)
         last_rot = "never" if not s["last_rotated"] else f"{human_duration(now - s['last_rotated'])} ago"
@@ -1474,6 +1472,7 @@ def render_dashboard() -> str:
   <label>auto-refresh <input id="refreshSeconds" type="number" min="0" max="3600" step="1"> seconds</label>
   <button onclick="saveRefresh()">Apply</button>
   <button onclick="location.reload()">Refresh now</button>
+  {stats_button}
 </div>
 <div class="cards">
   <div class="card"><div class="n">{snap['count']}</div><div class="l">instances</div></div>

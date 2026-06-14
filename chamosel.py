@@ -370,6 +370,7 @@ def generate(cfg: dict):
     names = [n for n, _, _ in instances]
 
     gluetun_global_env = gluetun_dns_env_overrides(cfg)
+    stats_url = f"http://{display_host(gset(cfg, 'stats_bind'))}:{gset(cfg, 'stats_port')}/stats"
     compose = jinja.get_template("docker-compose.yml.j2").render(
         instances=[{"name": n, "env": env_for(pk, pv, gluetun_global_env)} for n, pk, pv in instances],
         names=names,
@@ -394,6 +395,7 @@ def generate(cfg: dict):
         egress_verify_ttl=gset(cfg, "egress_verify_ttl"),
         egress_verify_on_fresh=str(gset(cfg, "egress_verify_on_fresh")).lower(),
         dashboard_refresh_seconds=gset(cfg, "dashboard_refresh_seconds"),
+        dashboard_stats_url=stats_url,
         controller_auth_enabled=str(controller_auth_enabled(cfg)).lower(),
         poll_interval=gset(cfg, "poll_interval"),
         auth_default_role=auth_role,
