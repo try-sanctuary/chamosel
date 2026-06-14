@@ -76,6 +76,7 @@ POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "15"))
 STATE_FILE = os.environ.get("STATE_FILE", "/data/state.json")
 HTTP_TIMEOUT = 8
 IP_HISTORY_MAX = 10
+CONTROLLER_STARTED_AT = time.time()
 ROTATION_RECOVERY_TIMEOUT = int(os.environ.get("ROTATION_RECOVERY_TIMEOUT", "30"))
 ROTATE_ALL_BATCH_SIZE = max(1, int(os.environ.get("ROTATE_ALL_BATCH_SIZE", "2")))
 ROTATE_ALL_BATCH_DELAY_SECONDS = max(0.0, float(os.environ.get("ROTATE_ALL_BATCH_DELAY_SECONDS", "2")))
@@ -272,12 +273,13 @@ class State:
             s["last_seen"] = time.time()
             if ip and ip != s["public_ip"]:
                 s["public_ip"] = ip
-                s["verified_proxy_ip"] = None
-                s["verified_proxy_ip_seen_at"] = 0.0
-                s["verified_proxy_ip_error"] = None
-                s["country"] = None
-                s["city"] = None
-                s["geo_source"] = None
+                if float(s.get("verified_proxy_ip_seen_at") or 0.0) < CONTROLLER_STARTED_AT:
+                    s["verified_proxy_ip"] = None
+                    s["verified_proxy_ip_seen_at"] = 0.0
+                    s["verified_proxy_ip_error"] = None
+                    s["country"] = None
+                    s["city"] = None
+                    s["geo_source"] = None
                 if not s["ip_history"] or s["ip_history"][0] != ip:
                     s["ip_history"].insert(0, ip)
                     del s["ip_history"][IP_HISTORY_MAX:]

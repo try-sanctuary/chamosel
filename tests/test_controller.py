@@ -466,13 +466,33 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual("89.187.163.10", refreshed["verified_proxy_ip"])
         self.assertEqual(["vpn_0"], calls)
 
-    def test_public_ip_change_clears_stale_verified_proxy_ip(self):
+    def test_public_ip_change_keeps_current_verified_proxy_ip(self):
         self.ctrl.STATE.update_health("vpn_0", True, "1.1.1.1", status=self.ctrl.STATUS_HEALTHY)
         self.ctrl.STATE.update_verified_proxy_ip(
             "vpn_0",
             "2.2.2.2",
             metadata={"country": "Germany", "city": "Berlin"},
         )
+
+        self.ctrl.STATE.update_health("vpn_0", True, "3.3.3.3", status=self.ctrl.STATUS_HEALTHY)
+        inst = self.ctrl.STATE.snapshot()["instances"][0]
+
+        self.assertEqual("3.3.3.3", inst["public_ip"])
+        self.assertEqual("2.2.2.2", inst["verified_proxy_ip"])
+        self.assertEqual("Germany", inst["country"])
+        self.assertEqual("Berlin", inst["city"])
+        self.assertTrue(inst["egress_state_fresh"])
+        self.assertTrue(inst["public_ip_mismatch"])
+
+    def test_public_ip_change_clears_previous_process_verified_proxy_ip(self):
+        self.ctrl.STATE.update_health("vpn_0", True, "1.1.1.1", status=self.ctrl.STATUS_HEALTHY)
+        self.ctrl.STATE.update_verified_proxy_ip(
+            "vpn_0",
+            "2.2.2.2",
+            metadata={"country": "Germany", "city": "Berlin"},
+        )
+        with self.ctrl.STATE.lock:
+            self.ctrl.STATE.inst["vpn_0"]["verified_proxy_ip_seen_at"] = self.ctrl.CONTROLLER_STARTED_AT - 1
 
         self.ctrl.STATE.update_health("vpn_0", True, "3.3.3.3", status=self.ctrl.STATUS_HEALTHY)
         inst = self.ctrl.STATE.snapshot()["instances"][0]
