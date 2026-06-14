@@ -263,7 +263,15 @@ class State:
         except Exception as e:
             log(f"could not save state: {e}")
 
-    def update_health(self, name: str, healthy: bool, ip=None, status: str | None = None, error: str | None = None):
+    def update_health(
+        self,
+        name: str,
+        healthy: bool,
+        ip=None,
+        status: str | None = None,
+        error: str | None = None,
+        metadata: dict | None = None,
+    ):
         with self.lock:
             s = self.inst[name]
             s["healthy"] = healthy
@@ -271,18 +279,20 @@ class State:
             s["state_fresh"] = True
             s["last_error"] = error
             s["last_seen"] = time.time()
+            ip_changed = bool(ip and ip != s["public_ip"])
             if ip and ip != s["public_ip"]:
                 s["public_ip"] = ip
                 if float(s.get("verified_proxy_ip_seen_at") or 0.0) < CONTROLLER_STARTED_AT:
                     s["verified_proxy_ip"] = None
                     s["verified_proxy_ip_seen_at"] = 0.0
                     s["verified_proxy_ip_error"] = None
-                    s["country"] = None
-                    s["city"] = None
-                    s["geo_source"] = None
                 if not s["ip_history"] or s["ip_history"][0] != ip:
                     s["ip_history"].insert(0, ip)
                     del s["ip_history"][IP_HISTORY_MAX:]
+            if ip and (metadata or ip_changed):
+                s["country"] = (metadata or {}).get("country")
+                s["city"] = (metadata or {}).get("city")
+                s["geo_source"] = (metadata or {}).get("source") or "gluetun"
             self._save_locked()
 
     def update_verified_proxy_ip(
@@ -298,9 +308,6 @@ class State:
                 s["verified_proxy_ip"] = ip
                 s["verified_proxy_ip_seen_at"] = time.time()
                 s["verified_proxy_ip_error"] = None
-                s["country"] = (metadata or {}).get("country")
-                s["city"] = (metadata or {}).get("city")
-                s["geo_source"] = (metadata or {}).get("source") or "verified_proxy_ip"
             else:
                 s["verified_proxy_ip_error"] = error or "egress verification failed"
             self._save_locked()
@@ -449,10 +456,6 @@ class State:
                     and egress_fresh
                     and s.get("public_ip") != s.get("verified_proxy_ip")
                 )
-                if not egress_fresh:
-                    s["country"] = None
-                    s["city"] = None
-                    s["geo_source"] = None
                 instances.append(s)
             pool_status, degraded_reasons, state_fresh = pool_summary(instances)
             return {
@@ -603,11 +606,29 @@ def _ctrl(method: str, instance: str, path: str, body: dict | None = None):
         return json.loads(raw) if raw else {}
 
 
-def get_public_ip(instance: str):
+def gluetun_public_ip_metadata(payload: dict) -> dict:
+    if not isinstance(payload, dict):
+        return {}
+    country = payload.get("country")
+    city = payload.get("city")
+    return {
+        "country": str(country).strip() if country else None,
+        "city": str(city).strip() if city else None,
+        "source": "gluetun",
+    }
+
+
+def get_public_ip_info(instance: str) -> dict:
     try:
-        return _ctrl("GET", instance, "/v1/publicip/ip").get("public_ip") or None
+        payload = _ctrl("GET", instance, "/v1/publicip/ip")
+        ip = payload.get("public_ip") or None
+        return {"public_ip": ip, **gluetun_public_ip_metadata(payload)}
     except Exception:
-        return None
+        return {"public_ip": None}
+
+
+def get_public_ip(instance: str):
+    return get_public_ip_info(instance).get("public_ip")
 
 
 def is_public_ip(value: str) -> bool:
@@ -766,8 +787,9 @@ def is_healthy(instance: str) -> bool:
 
 def refresh_instance(instance: str, verify_egress: bool = False, force_egress: bool = False) -> dict:
     healthy, status, error = read_health(instance)
-    ip = get_public_ip(instance) if healthy else None
-    STATE.update_health(instance, healthy, ip, status=status, error=error)
+    ip_info = get_public_ip_info(instance) if healthy else {"public_ip": None}
+    ip = ip_info.get("public_ip")
+    STATE.update_health(instance, healthy, ip, status=status, error=error, metadata=ip_info)
     result = {"instance": instance, "healthy": healthy, "status": status, "error": error, "public_ip": ip}
     if healthy and verify_egress:
         result["egress"] = refresh_verified_proxy_ip(instance, force=force_egress)
@@ -1032,10 +1054,11 @@ def wait_for_recovery(
     while time.time() < deadline:
         h = is_healthy(instance)
         if h:
-            new_ip = get_public_ip(instance)
+            ip_info = get_public_ip_info(instance)
+            new_ip = ip_info.get("public_ip")
             if new_ip:
                 last_new_ip = new_ip
-                STATE.update_health(instance, True, new_ip, status=STATUS_HEALTHY)
+                STATE.update_health(instance, True, new_ip, status=STATUS_HEALTHY, metadata=ip_info)
             if repair_duplicate_ip:
                 proxy_ok, proxy_error = verify_proxy_after_rotation(instance)
                 if not proxy_ok:
@@ -1433,8 +1456,8 @@ def render_dashboard() -> str:
         cooldown = s.get("cooldown_remaining_seconds") or 0
         cooldown_text = f"{human_duration(cooldown)} ({s.get('cooldown_reason')})" if cooldown > 0 else "-"
         verified_proxy_ip = s.get("verified_proxy_ip") if s.get("egress_state_fresh") else None
-        country = s.get("country") if s.get("egress_state_fresh") else None
-        city = s.get("city") if s.get("egress_state_fresh") else None
+        country = s.get("country")
+        city = s.get("city")
         name = html.escape(s["name"], quote=True)
         rows.append(
             f'<tr><td><input type="radio" name="instance" value="{name}" {"checked" if index == 0 else ""}></td>'

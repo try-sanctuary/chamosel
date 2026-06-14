@@ -265,7 +265,9 @@ class ControllerTests(unittest.TestCase):
             return health_calls["count"] >= 2
 
         self.ctrl._ctrl = fake_ctrl
-        self.ctrl.get_public_ip = lambda instance: "2.2.2.2" if health_calls["count"] >= 2 else "1.1.1.1"
+        self.ctrl.get_public_ip_info = lambda instance: {
+            "public_ip": "2.2.2.2" if health_calls["count"] >= 2 else "1.1.1.1"
+        }
         self.ctrl.is_healthy = fake_healthy
         self.ctrl.refresh_verified_proxy_ip = lambda instance, force=False: {"verified_proxy_ip": "2.2.2.2"}
         self.ctrl.sleep = lambda seconds: None
@@ -467,14 +469,22 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(["vpn_0"], calls)
 
     def test_public_ip_change_keeps_current_verified_proxy_ip(self):
-        self.ctrl.STATE.update_health("vpn_0", True, "1.1.1.1", status=self.ctrl.STATUS_HEALTHY)
-        self.ctrl.STATE.update_verified_proxy_ip(
+        self.ctrl.STATE.update_health(
             "vpn_0",
-            "2.2.2.2",
+            True,
+            "1.1.1.1",
+            status=self.ctrl.STATUS_HEALTHY,
+            metadata={"country": "United States", "city": "Detroit"},
+        )
+        self.ctrl.STATE.update_verified_proxy_ip("vpn_0", "2.2.2.2")
+
+        self.ctrl.STATE.update_health(
+            "vpn_0",
+            True,
+            "3.3.3.3",
+            status=self.ctrl.STATUS_HEALTHY,
             metadata={"country": "Germany", "city": "Berlin"},
         )
-
-        self.ctrl.STATE.update_health("vpn_0", True, "3.3.3.3", status=self.ctrl.STATUS_HEALTHY)
         inst = self.ctrl.STATE.snapshot()["instances"][0]
 
         self.assertEqual("3.3.3.3", inst["public_ip"])
@@ -517,8 +527,14 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual("Germany", metadata["country"])
         self.assertEqual("Berlin", metadata["city"])
 
-    def test_refresh_verified_proxy_ip_stores_geo_metadata(self):
-        self.ctrl.STATE.update_health("vpn_0", True, "1.1.1.1", status=self.ctrl.STATUS_HEALTHY)
+    def test_refresh_verified_proxy_ip_does_not_overwrite_gluetun_geo_metadata(self):
+        self.ctrl.STATE.update_health(
+            "vpn_0",
+            True,
+            "1.1.1.1",
+            status=self.ctrl.STATUS_HEALTHY,
+            metadata={"country": "United States", "city": "Detroit"},
+        )
         self.ctrl.probe_verified_proxy_ip = lambda instance: (
             "45.134.140.5",
             None,
@@ -530,8 +546,25 @@ class ControllerTests(unittest.TestCase):
 
         self.assertEqual("Germany", result["country"])
         self.assertEqual("Berlin", result["city"])
-        self.assertEqual("Germany", inst["country"])
-        self.assertEqual("Berlin", inst["city"])
+        self.assertEqual("United States", inst["country"])
+        self.assertEqual("Detroit", inst["city"])
+
+    def test_refresh_instance_stores_gluetun_geo_metadata(self):
+        self.ctrl.read_health = lambda instance: (True, self.ctrl.STATUS_HEALTHY, None)
+        self.ctrl.get_public_ip_info = lambda instance: {
+            "public_ip": "185.141.119.47",
+            "country": "United States",
+            "city": "Detroit",
+            "source": "gluetun",
+        }
+
+        result = self.ctrl.refresh_instance("vpn_0")
+        inst = self.ctrl.STATE.snapshot()["instances"][0]
+
+        self.assertEqual("185.141.119.47", result["public_ip"])
+        self.assertEqual("United States", inst["country"])
+        self.assertEqual("Detroit", inst["city"])
+        self.assertEqual("gluetun", inst["geo_source"])
 
     def test_public_ip_mismatch_does_not_schedule_repair_when_verified_ips_unique(self):
         calls = []
@@ -637,7 +670,7 @@ class ControllerTests(unittest.TestCase):
 
         self.ctrl._ctrl = fake_ctrl
         self.ctrl.is_healthy = lambda instance: True
-        self.ctrl.get_public_ip = lambda instance: "64.44.86.142"
+        self.ctrl.get_public_ip_info = lambda instance: {"public_ip": "64.44.86.142"}
         self.ctrl.refresh_verified_proxy_ip = lambda instance, force=False: {"verified_proxy_ip": "37.19.221.87"}
         self.ctrl.sleep = lambda seconds: None
         self.ctrl.STATE.update_health("vpn_1", True, "64.44.86.142", status=self.ctrl.STATUS_HEALTHY)
@@ -894,7 +927,7 @@ class ControllerTests(unittest.TestCase):
         self.ctrl.STATE.start_cooldown("vpn_0", self.ctrl.OUTCOME_RECOVERY_TIMEOUT)
         self.ctrl.STATE.update_health("vpn_0", True, "1.1.1.1", status=self.ctrl.STATUS_HEALTHY)
         self.ctrl.is_healthy = lambda instance: True
-        self.ctrl.get_public_ip = lambda instance: "2.2.2.2"
+        self.ctrl.get_public_ip_info = lambda instance: {"public_ip": "2.2.2.2"}
         self.ctrl.refresh_verified_proxy_ip = lambda instance, force=False: {"verified_proxy_ip": "2.2.2.2"}
         self.ctrl.sleep = lambda seconds: None
 
@@ -916,7 +949,7 @@ class ControllerTests(unittest.TestCase):
         self.ctrl._ctrl = fake_ctrl
         self.ctrl.STATE.update_health("vpn_0", True, "1.1.1.1", status=self.ctrl.STATUS_HEALTHY)
         self.ctrl.is_healthy = lambda instance: True
-        self.ctrl.get_public_ip = lambda instance: "1.1.1.1"
+        self.ctrl.get_public_ip_info = lambda instance: {"public_ip": "1.1.1.1"}
         self.ctrl.sleep = lambda seconds: None
 
         result = self.ctrl.rotate_instance("vpn_0", force=True)
@@ -938,7 +971,7 @@ class ControllerTests(unittest.TestCase):
         self.ctrl._ctrl = fake_ctrl
         self.ctrl.STATE.update_health("vpn_0", True, "1.1.1.1", status=self.ctrl.STATUS_HEALTHY)
         self.ctrl.is_healthy = lambda instance: True
-        self.ctrl.get_public_ip = lambda instance: "2.2.2.2"
+        self.ctrl.get_public_ip_info = lambda instance: {"public_ip": "2.2.2.2"}
         self.ctrl.verify_proxy_after_rotation = lambda instance: (False, "proxy refused")
         self.ctrl.sleep = lambda seconds: None
 
@@ -1060,12 +1093,14 @@ class ControllerTests(unittest.TestCase):
         self.assertNotIn("recent ips", html)
 
     def test_dashboard_hides_stale_verified_proxy_ip_and_marks_ready(self):
-        self.ctrl.STATE.update_health("vpn_0", True, "1.1.1.1", status=self.ctrl.STATUS_HEALTHY)
-        self.ctrl.STATE.update_verified_proxy_ip(
+        self.ctrl.STATE.update_health(
             "vpn_0",
-            "2.2.2.2",
+            True,
+            "1.1.1.1",
+            status=self.ctrl.STATUS_HEALTHY,
             metadata={"country": "Germany", "city": "Berlin"},
         )
+        self.ctrl.STATE.update_verified_proxy_ip("vpn_0", "2.2.2.2")
         with self.ctrl.STATE.lock:
             self.ctrl.STATE.inst["vpn_0"]["verified_proxy_ip_seen_at"] = time.time() - 999
 
@@ -1073,16 +1108,18 @@ class ControllerTests(unittest.TestCase):
 
         self.assertIn("ready", html)
         self.assertNotIn("2.2.2.2", html)
-        self.assertNotIn("Germany", html)
-        self.assertNotIn("Berlin", html)
+        self.assertIn("Germany", html)
+        self.assertIn("Berlin", html)
 
-    def test_dashboard_exposes_fresh_verified_proxy_geo(self):
-        self.ctrl.STATE.update_health("vpn_0", True, "1.1.1.1", status=self.ctrl.STATUS_HEALTHY)
-        self.ctrl.STATE.update_verified_proxy_ip(
+    def test_dashboard_exposes_gluetun_geo(self):
+        self.ctrl.STATE.update_health(
             "vpn_0",
-            "2.2.2.2",
+            True,
+            "1.1.1.1",
+            status=self.ctrl.STATUS_HEALTHY,
             metadata={"country": "Germany", "city": "Berlin"},
         )
+        self.ctrl.STATE.update_verified_proxy_ip("vpn_0", "2.2.2.2")
 
         html = self.ctrl.render_dashboard()
 
