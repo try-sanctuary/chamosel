@@ -1630,7 +1630,7 @@ def cmd_up(cfg, pull_images: bool = True):
         compose_cmd(["pull", "--ignore-buildable"])
     else:
         log.info("Skipping image pull (--no-pull)")
-    compose_cmd(["up", "-d", "--build", "--remove-orphans"])
+    compose_cmd(["up", "-d", "--build", "--remove-orphans", "--force-recreate"])
     proxy_host = display_host(gset(cfg, "proxy_bind"))
     api_host = display_host(gset(cfg, "api_bind"))
     stats_host = display_host(gset(cfg, "stats_bind"))

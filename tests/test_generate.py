@@ -318,7 +318,7 @@ class GenerateTests(unittest.TestCase):
             [
                 ("generate", None),
                 ("compose", ["pull", "--ignore-buildable"]),
-                ("compose", ["up", "-d", "--build", "--remove-orphans"]),
+                ("compose", ["up", "-d", "--build", "--remove-orphans", "--force-recreate"]),
             ],
             calls,
         )
@@ -333,7 +333,7 @@ class GenerateTests(unittest.TestCase):
         self.assertEqual(
             [
                 ("generate", None),
-                ("compose", ["up", "-d", "--build", "--remove-orphans"]),
+                ("compose", ["up", "-d", "--build", "--remove-orphans", "--force-recreate"]),
             ],
             calls,
         )
