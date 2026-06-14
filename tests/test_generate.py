@@ -262,6 +262,47 @@ class GenerateTests(unittest.TestCase):
             calls,
         )
 
+    def test_cmd_up_logs_configured_bind_addresses(self):
+        cfg = self.base_config()
+        cfg["global_settings"].update(
+            {
+                "api_bind": "10.20.20.3",
+                "stats_bind": "10.20.20.4",
+                "proxy_port": 8890,
+                "api_port": 8801,
+                "stats_port": 8405,
+            }
+        )
+        self.chamosel.generate = lambda cfg: None
+        self.chamosel.compose_cmd = lambda args, capture=False: None
+
+        with self.assertLogs("chamosel", level="INFO") as logs:
+            self.chamosel.cmd_up(cfg, pull_images=False)
+
+        rendered_logs = "\n".join(logs.output)
+        self.assertIn("Proxy http://10.20.20.3:8890", rendered_logs)
+        self.assertIn("API+dashboard http://10.20.20.3:8801", rendered_logs)
+        self.assertIn("Stats http://10.20.20.4:8405/stats", rendered_logs)
+
+    def test_compose_cmd_sanitizes_missing_plugin_help_output(self):
+        leaked_help = (
+            "unknown shorthand flag: 'f' in -f\n"
+            "Location of client config files (default \"/home/private-user/.docker\")\n"
+        )
+
+        def fake_run(*args, **kwargs):
+            raise self.chamosel.subprocess.CalledProcessError(125, args[0], stderr=leaked_help)
+
+        self.chamosel.subprocess.run = fake_run
+
+        with self.assertLogs("chamosel", level="ERROR") as logs:
+            with self.assertRaises(SystemExit):
+                self.chamosel.compose_cmd(["pull", "--ignore-buildable"])
+
+        rendered_logs = "\n".join(logs.output)
+        self.assertIn("Docker Compose v2 plugin is not available", rendered_logs)
+        self.assertNotIn("/home/private-user", rendered_logs)
+
     def test_env_file_and_config_key_conflict_fails(self):
         Path(".env").write_text("GLUETUN_API_KEY=other-secret\n")
 

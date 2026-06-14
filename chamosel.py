@@ -345,6 +345,15 @@ def write_text(path: str, content: str):
         fh.write(content)
 
 
+def display_host(value: str, fallback: str = "localhost") -> str:
+    value = str(value or "").strip()
+    if value in ("", "0.0.0.0", "::"):
+        return fallback
+    if ":" in value and not value.startswith("["):
+        return f"[{value}]"
+    return value
+
+
 def generate(cfg: dict):
     validate_controller_exposure(cfg)
     api_key_info = resolve_api_key_info(cfg)
@@ -404,15 +413,34 @@ def generate(cfg: dict):
     log.info("Generated %s (%d instances) and %s", COMPOSE_FILE, len(names), HAPROXY_FILE)
 
 
+def sanitize_tool_output(text: str) -> str:
+    lines = []
+    for raw_line in (text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if "Location of client config files" in line:
+            line = "Location of client config files (default /home/example/.docker)"
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def compose_cmd(args: list, capture=False):
     try:
         r = subprocess.run(["docker", "compose", "-f", COMPOSE_FILE] + args,
-                            text=True, capture_output=capture, check=True)
+                            text=True, capture_output=True, check=True)
         return r.stdout if capture else ""
     except FileNotFoundError:
         log.error("docker not found"); sys.exit(1)
     except subprocess.CalledProcessError as e:
-        log.error("compose %s failed: %s", " ".join(args), e.stderr or e.stdout); sys.exit(1)
+        rendered = sanitize_tool_output(e.stderr or e.stdout)
+        if "unknown shorthand flag: 'f' in -f" in rendered:
+            rendered = (
+                "Docker Compose v2 plugin is not available or not recognized. "
+                "Install docker-compose-plugin, then verify with `docker compose version`."
+            )
+        log.error("compose %s failed: %s", " ".join(args), rendered or "no output")
+        sys.exit(1)
 
 
 def compose_check(args: list, timeout: int = 15) -> dict:
@@ -1349,8 +1377,18 @@ def cmd_up(cfg, pull_images: bool = True):
     else:
         log.info("Skipping image pull (--no-pull)")
     compose_cmd(["up", "-d", "--build", "--remove-orphans"])
-    log.info("Pool up. Proxy http://localhost:%s | API+dashboard http://localhost:%s | Stats http://localhost:%s/stats",
-             gset(cfg, "proxy_port"), gset(cfg, "api_port"), gset(cfg, "stats_port"))
+    proxy_host = display_host(gset(cfg, "api_bind"))
+    api_host = display_host(gset(cfg, "api_bind"))
+    stats_host = display_host(gset(cfg, "stats_bind"))
+    log.info(
+        "Pool up. Proxy http://%s:%s | API+dashboard http://%s:%s | Stats http://%s:%s/stats",
+        proxy_host,
+        gset(cfg, "proxy_port"),
+        api_host,
+        gset(cfg, "api_port"),
+        stats_host,
+        gset(cfg, "stats_port"),
+    )
 
 
 def cmd_status(cfg):
