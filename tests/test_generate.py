@@ -527,6 +527,14 @@ class GenerateTests(unittest.TestCase):
         self.assertIn("chown -R chamosel:chamosel /data", entrypoint)
         self.assertIn("exec su-exec chamosel python controller.py", entrypoint)
 
+    def test_controller_has_chown_capability_for_state_volume_migration(self):
+        self.chamosel.generate(self.base_config())
+        compose = yaml.safe_load(Path("docker-compose.yml").read_text())
+        controller = compose["services"]["controller"]
+
+        self.assertEqual(["ALL"], controller["cap_drop"])
+        self.assertEqual(["CHOWN"], controller["cap_add"])
+
     def test_env_file_and_config_key_conflict_fails(self):
         Path(".env").write_text("GLUETUN_API_KEY=other-secret\n")
 
