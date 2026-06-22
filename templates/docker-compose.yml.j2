@@ -69,6 +69,8 @@ services:
       - ALL
     cap_add:
       - CHOWN
+      - SETGID
+      - SETUID
     security_opt:
       - no-new-privileges:true
     read_only: true
