@@ -518,6 +518,15 @@ class GenerateTests(unittest.TestCase):
         self.assertEqual(["docker", "compose", "-f", "docker-compose.yml", "pull", "--ignore-buildable"], calls[1][0])
         self.assertFalse(calls[1][1]["capture_output"])
 
+    def test_controller_image_migrates_state_volume_then_drops_privileges(self):
+        dockerfile = (ROOT / "controller" / "Dockerfile").read_text()
+        entrypoint = (ROOT / "controller" / "entrypoint.sh").read_text()
+
+        self.assertIn("apk add --no-cache su-exec", dockerfile)
+        self.assertIn("ENTRYPOINT [\"/entrypoint.sh\"]", dockerfile)
+        self.assertIn("chown -R chamosel:chamosel /data", entrypoint)
+        self.assertIn("exec su-exec chamosel python controller.py", entrypoint)
+
     def test_env_file_and_config_key_conflict_fails(self):
         Path(".env").write_text("GLUETUN_API_KEY=other-secret\n")
 

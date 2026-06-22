@@ -1,12 +1,14 @@
 FROM python:3.12-alpine
 WORKDIR /app
 COPY controller.py .
+COPY entrypoint.sh /entrypoint.sh
 # stdlib only - no pip install needed
-RUN addgroup -S chamosel && adduser -S -G chamosel chamosel \
+RUN apk add --no-cache su-exec \
+  && addgroup -S chamosel && adduser -S -G chamosel chamosel \
   && mkdir -p /data \
-  && chown -R chamosel:chamosel /data /app
-USER chamosel
+  && chown -R chamosel:chamosel /data /app \
+  && chmod 755 /entrypoint.sh
 EXPOSE 8800
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
   CMD wget -qO- http://127.0.0.1:8800/health || exit 1
-ENTRYPOINT ["python", "controller.py"]
+ENTRYPOINT ["/entrypoint.sh"]
