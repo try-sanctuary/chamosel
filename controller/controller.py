@@ -575,12 +575,26 @@ def instance_proxy_degraded(s: dict) -> bool:
     return s.get("last_rotation_outcome") == OUTCOME_PROXY_FAILURE and not s.get("egress_state_fresh")
 
 
+def instance_recovery_timed_out(s: dict) -> bool:
+    if s.get("last_rotation_outcome") != OUTCOME_RECOVERY_TIMEOUT:
+        return False
+    # Keep the failed attempt in history, but stop reporting it as a current
+    # outage once a later live poll sees the VPN running with a public IP.
+    recovered = (
+        s.get("state_fresh")
+        and s.get("healthy")
+        and s.get("public_ip")
+        and (s.get("last_seen") or 0) > (s.get("last_rotation_attempted") or 0)
+    )
+    return not recovered
+
+
 def instance_display_state(s: dict) -> tuple[str, str]:
     if not s.get("healthy"):
         return s.get("status") or STATUS_UNREACHABLE, "#ef4444"
     if instance_proxy_degraded(s):
         return OUTCOME_PROXY_FAILURE, "#f59e0b"
-    if s.get("last_rotation_outcome") in (OUTCOME_RECOVERY_TIMEOUT, OUTCOME_HEALTHY_IP_UNCHANGED):
+    if instance_recovery_timed_out(s) or s.get("last_rotation_outcome") == OUTCOME_HEALTHY_IP_UNCHANGED:
         return s.get("last_rotation_outcome"), "#f59e0b"
     return s.get("status") or STATUS_HEALTHY, "#22c55e"
 
@@ -621,7 +635,7 @@ def pool_summary(instances: list[dict]) -> tuple[str, list[str], bool]:
         reasons.append(DEGRADED_TOO_FEW_HEALTHY)
 
     latest_outcomes = {s.get("last_rotation_outcome") for s in instances}
-    if OUTCOME_RECOVERY_TIMEOUT in latest_outcomes:
+    if any(instance_recovery_timed_out(s) for s in instances):
         reasons.append(DEGRADED_RECOVERY_TIMEOUT)
     if any(instance_proxy_degraded(s) for s in instances):
         reasons.append(DEGRADED_PROXY_FAILURE)
@@ -1583,6 +1597,7 @@ def render_dashboard() -> str:
   <button onclick="rotateSelected()">Rotate selected</button>
   <button onclick="rotateAny()">Rotate one</button>
 </p>
+<p class="sub" id="actionStatus" role="status" aria-live="polite"></p>
 <table>
   <tr><th>select</th><th>instance</th><th>state</th><th>fresh</th><th>public ip</th><th>verified proxy ip</th><th>country</th><th>city</th><th>mismatch</th><th>rotations</th><th>last rotated</th><th>outcome</th><th>cooldown</th></tr>
   {''.join(rows)}
@@ -1600,12 +1615,39 @@ function saveRefresh() {{
   localStorage.setItem("chamosel.refreshSeconds", String(currentRefreshSeconds()));
   location.reload();
 }}
-const refreshSeconds = currentRefreshSeconds();
-if (refreshSeconds > 0) {{
-  window.setTimeout(() => location.reload(), refreshSeconds * 1000);
+let refreshTimer;
+let actionPending = false;
+function scheduleRefresh() {{
+  window.clearTimeout(refreshTimer);
+  const refreshSeconds = currentRefreshSeconds();
+  if (!actionPending && refreshSeconds > 0) {{
+    refreshTimer = window.setTimeout(() => location.reload(), refreshSeconds * 1000);
+  }}
 }}
-function reloadSoon() {{
-  window.setTimeout(() => location.reload(), 1200);
+scheduleRefresh();
+async function runAction(path) {{
+  if (actionPending) return;
+  actionPending = true;
+  window.clearTimeout(refreshTimer);
+  const buttons = document.querySelectorAll("button");
+  buttons.forEach(button => button.disabled = true);
+  const status = document.getElementById("actionStatus");
+  status.textContent = "Operation in progress; waiting for the controller…";
+  try {{
+    const response = await fetch(path, {{method:'POST', headers: {{'X-Chamosel-CSRF':'1'}}}});
+    if (!response.ok) throw new Error(`HTTP ${{response.status}}`);
+    const result = await response.json();
+    if (result.ok === false) {{
+      throw new Error(result.rotation?.message || result.message || result.outcome || "Operation failed");
+    }}
+    location.reload();
+  }} catch (error) {{
+    status.textContent = `Operation failed: ${{error.message}}`;
+  }} finally {{
+    actionPending = false;
+    buttons.forEach(button => button.disabled = false);
+    scheduleRefresh();
+  }}
 }}
 function selectedInstance() {{
   const selected = document.querySelector('input[name="instance"]:checked');
@@ -1614,19 +1656,19 @@ function selectedInstance() {{
 function rotateSelected() {{
   const instance = selectedInstance();
   if (!instance) return;
-  fetch(`/rotate/${{encodeURIComponent(instance)}}?force=0`, {{method:'POST', headers: {{'X-Chamosel-CSRF':'1'}}}}).then(reloadSoon);
+  return runAction(`/rotate/${{encodeURIComponent(instance)}}?force=0`);
 }}
 function repairSelected() {{
   const instance = selectedInstance();
   if (!instance) return;
-  fetch(`/repair/${{encodeURIComponent(instance)}}`, {{method:'POST', headers: {{'X-Chamosel-CSRF':'1'}}}}).then(reloadSoon);
+  return runAction(`/repair/${{encodeURIComponent(instance)}}`);
 }}
 function toggleAutoRepair() {{
   const enabled = document.getElementById("autoRepairState").textContent.trim() !== "ON";
-  fetch(`/repair/auto?enabled=${{enabled ? "1" : "0"}}`, {{method:'POST', headers: {{'X-Chamosel-CSRF':'1'}}}}).then(reloadSoon);
+  return runAction(`/repair/auto?enabled=${{enabled ? "1" : "0"}}`);
 }}
 function rotateAny() {{
-  fetch('/rotate', {{method:'POST', headers: {{'X-Chamosel-CSRF':'1'}}}}).then(reloadSoon);
+  return runAction('/rotate');
 }}
 </script></body></html>"""
 
@@ -1645,8 +1687,13 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         for name, value in (headers or {}).items():
             self.send_header(name, value)
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            # The operation has already completed. A disconnected client must
+            # not turn response delivery into a request-thread traceback.
+            self.close_connection = True
 
     def log_message(self, fmt, *args):
         log(f"{self.address_string()} {fmt % args}")

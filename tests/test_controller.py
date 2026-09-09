@@ -1,10 +1,13 @@
 import importlib.util
 import os
+import shutil
+import subprocess
 import tempfile
 import time
 import unittest
 import urllib.error
 from pathlib import Path
+from unittest.mock import Mock
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -45,6 +48,69 @@ class ControllerTests(unittest.TestCase):
 
     def tearDown(self):
         self.tmp.cleanup()
+
+    def response_handler(self):
+        handler = self.ctrl.Handler.__new__(self.ctrl.Handler)
+        handler.request_version = "HTTP/1.1"
+        handler.requestline = "POST /repair/vpn_0 HTTP/1.1"
+        handler.command = "POST"
+        handler.close_connection = False
+        handler.log_message = Mock()
+        handler.wfile = Mock()
+        return handler
+
+    def test_response_tolerates_disconnect_during_headers_and_body(self):
+        for error in (BrokenPipeError, ConnectionResetError):
+            for stage in ("headers", "body"):
+                with self.subTest(error=error.__name__, stage=stage):
+                    handler = self.response_handler()
+                    handler.wfile.write.side_effect = (
+                        [error()] if stage == "headers" else [None, error()]
+                    )
+
+                    handler._json(200, {"ok": True})
+
+                    self.assertTrue(handler.close_connection)
+                    self.assertEqual(1 if stage == "headers" else 2, handler.wfile.write.call_count)
+
+    def test_response_preserves_headers_and_json_body(self):
+        handler = self.response_handler()
+
+        handler._raw(200, b'{"ok": true}', "application/json", {"X-Test": "present"})
+
+        headers, body = [call.args[0] for call in handler.wfile.write.call_args_list]
+        self.assertIn(b"HTTP/1.0 200 OK\r\n", headers)
+        self.assertIn(b"Content-Length: 12\r\n", headers)
+        self.assertIn(b"X-Test: present\r\n", headers)
+        self.assertEqual(b'{"ok": true}', body)
+        self.assertFalse(handler.close_connection)
+
+    def test_response_does_not_suppress_unrelated_io_errors(self):
+        handler = self.response_handler()
+        handler.wfile.write.side_effect = OSError("unrelated failure")
+
+        with self.assertRaisesRegex(OSError, "unrelated failure"):
+            handler._json(200, {"ok": True})
+
+    def test_selected_repair_completes_once_when_client_disconnects(self):
+        handler = self.response_handler()
+        handler.path = "/repair/vpn_0"
+        handler.headers = {}
+        handler.wfile.write.side_effect = BrokenPipeError()
+        self.ctrl.repair_selected_instance = Mock(return_value={"ok": True})
+
+        handler.do_POST()
+
+        self.ctrl.repair_selected_instance.assert_called_once_with("vpn_0")
+        self.assertTrue(handler.close_connection)
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js is needed for dashboard behavior tests")
+    def test_dashboard_action_lifecycle(self):
+        result = subprocess.run(
+            ["node", str(ROOT / "tests" / "dashboard_actions.cjs")],
+            input=self.ctrl.render_dashboard(), text=True, capture_output=True, timeout=15,
+        )
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
 
     def test_stale_status_path_is_re_detected_after_404(self):
         calls = []
@@ -948,6 +1014,56 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(self.ctrl.OUTCOME_RECOVERY_TIMEOUT, result["outcome"])
         self.assertGreater(state["cooldown_remaining_seconds"], 0)
         self.assertEqual(self.ctrl.OUTCOME_RECOVERY_TIMEOUT, state["cooldown_reason"])
+
+    def test_late_recovery_clears_current_timeout_but_preserves_failed_attempt(self):
+        self.ctrl.STATE.update_health("vpn_0", True, "1.1.1.1")
+        self.ctrl.STATE.update_health("vpn_1", True, "2.2.2.2")
+        self.ctrl.STATE.start_cooldown("vpn_0", self.ctrl.OUTCOME_RECOVERY_TIMEOUT)
+        self.ctrl.STATE.record_rotation("vpn_0", self.ctrl.OUTCOME_RECOVERY_TIMEOUT, old_ip="1.1.1.1")
+        before = self.ctrl.STATE.snapshot()
+        self.assertIn(self.ctrl.DEGRADED_RECOVERY_TIMEOUT, before["degraded_reasons"])
+        self.assertEqual(self.ctrl.OUTCOME_RECOVERY_TIMEOUT, self.ctrl.instance_display_state(before["instances"][0])[0])
+
+        self.ctrl.read_health = lambda instance: (True, self.ctrl.STATUS_HEALTHY, None)
+        self.ctrl.get_public_ip_info = lambda instance: {"public_ip": "3.3.3.3"}
+        self.ctrl.refresh_instance("vpn_0")
+
+        recovered = self.ctrl.STATE.snapshot()
+        state = recovered["instances"][0]
+        self.assertEqual(self.ctrl.POOL_STATUS_HEALTHY, recovered["pool_status"])
+        self.assertEqual(self.ctrl.STATUS_HEALTHY, self.ctrl.instance_display_state(state)[0])
+        self.assertEqual(self.ctrl.OUTCOME_RECOVERY_TIMEOUT, state["last_rotation_outcome"])
+        self.assertEqual(1, recovered["rotation_errors_total"])
+        self.assertEqual(0, recovered["rotations_total"])
+        self.assertGreater(state["cooldown_remaining_seconds"], 0)
+        self.assertIn('chamosel_pool_status{status="healthy"} 1', self.ctrl.render_metrics())
+        self.assertNotIn('<td>recovery_timeout</td><td>yes</td>', self.ctrl.render_dashboard())
+
+    def test_timeout_stays_active_without_later_fresh_healthy_state_and_ip(self):
+        base = {
+            "last_rotation_outcome": self.ctrl.OUTCOME_RECOVERY_TIMEOUT,
+            "state_fresh": True, "healthy": True, "public_ip": "1.1.1.1",
+            "last_seen": 20, "last_rotation_attempted": 10,
+        }
+        self.assertFalse(self.ctrl.instance_recovery_timed_out(base))
+        for missing_recovery in (
+            {"state_fresh": False}, {"healthy": False}, {"public_ip": None},
+            {"last_seen": 9}, {"last_seen": 10},
+        ):
+            with self.subTest(state=missing_recovery):
+                self.assertTrue(self.ctrl.instance_recovery_timed_out({**base, **missing_recovery}))
+
+    def test_late_vpn_recovery_does_not_hide_proxy_failure(self):
+        self.ctrl.STATE.update_health("vpn_1", True, "2.2.2.2")
+        self.ctrl.STATE.record_rotation("vpn_0", self.ctrl.OUTCOME_RECOVERY_TIMEOUT)
+        self.ctrl.STATE.update_health("vpn_0", True, "1.1.1.1")
+        self.ctrl.STATE.update_verified_proxy_ip("vpn_0", None, "proxy refused")
+
+        snap = self.ctrl.STATE.snapshot()
+
+        self.assertEqual(self.ctrl.POOL_STATUS_DEGRADED, snap["pool_status"])
+        self.assertIn(self.ctrl.DEGRADED_PROXY_FAILURE, snap["degraded_reasons"])
+        self.assertEqual(self.ctrl.OUTCOME_PROXY_FAILURE, self.ctrl.instance_display_state(snap["instances"][0])[0])
 
     def test_rotate_all_skips_cooling_backends_and_rotates_eligible(self):
         calls = []
