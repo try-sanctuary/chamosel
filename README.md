@@ -47,6 +47,12 @@ python chamosel.py up              # generate configs, pull latest images, compo
 curl -x http://localhost:8888 https://ipinfo.io/ip
 ```
 
+The default Gluetun image is `qmcgaw/gluetun:v3.41.3`
+([release notes](https://github.com/passteque/gluetun/releases/tag/v3.41.3)).
+For an existing installation, set `global_settings.image` in `config.yml` to
+`qmcgaw/gluetun:v3.41.3`, then run `python3 chamosel.py up` to pull the image and
+recreate the VPN containers. An explicit image in `config.yml` overrides the default.
+
 If `python3 chamosel.py up` fails with `ModuleNotFoundError: No module named 'dataclasses'`,
 your `python3` is older than the supported runtime. Use Python 3.10 or newer and run the CLI
 from the virtual environment above.
@@ -223,7 +229,7 @@ global_settings:
   stats_allowed_cidrs: ""   # comma-separated source CIDRs allowed to view stats
   api_port: 8800
   # env_file: .env.local    # optional provider secrets file for gluetun services
-  image: qmcgaw/gluetun:v3
+  image: qmcgaw/gluetun:v3.41.3
   balance: roundrobin        # or leastconn
   auto_rotate_seconds: 0     # 0 = off; e.g. 1800 = rotate one every 30 min
   rotate_cooldown: 60        # min seconds between rotations of same instance

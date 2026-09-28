@@ -622,7 +622,7 @@ class VerifyLeakTests(unittest.TestCase):
         report = self.chamosel.doctor_report(self.cfg)
 
         self.assertFalse(report["checks"]["image_freshness"]["ok"])
-        self.assertIn("qmcgaw/gluetun:v3", report["checks"]["image_freshness"]["mutable_images"])
+        self.assertIn("qmcgaw/gluetun:v3.41.3", report["checks"]["image_freshness"]["mutable_images"])
 
     def test_doctor_reports_duplicate_ip_repair_in_progress(self):
         self.chamosel.compose_check = lambda args: {"ok": True, "returncode": 0, "stdout": "ok", "stderr": ""}

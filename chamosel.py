@@ -76,7 +76,7 @@ DEFAULTS = {
     "stats_allowed_cidrs": "",
     "api_port": 8800,
     "env_file": "",
-    "image": "qmcgaw/gluetun:v3",
+    "image": "qmcgaw/gluetun:v3.41.3",
     "haproxy_image": "haproxy:3.0-alpine",
     "balance": "roundrobin",
     "auto_rotate_seconds": 0,

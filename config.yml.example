@@ -15,7 +15,7 @@ global_settings:
   stats_allowed_cidrs: ""   # comma-separated source CIDRs allowed to view stats
   api_port: 8800            # controller REST API + dashboard + /metrics
   # env_file: .env.local    # optional provider secrets file for generated gluetun services
-  image: qmcgaw/gluetun:v3
+  image: qmcgaw/gluetun:v3.41.3
   haproxy_image: haproxy:3.0-alpine
   balance: roundrobin       # or leastconn
   auto_rotate_seconds: 0    # 0 = off; e.g. 1800 rotates one instance every 30 min
